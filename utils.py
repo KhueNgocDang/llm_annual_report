@@ -30,7 +30,9 @@ CRITERIA
 """
 
 
-def generate_category_embeddings(embedding_model: str) -> pd.DataFrame:
+def generate_category_embeddings(
+    openai_client: OpenAI, embedding_model: str
+) -> pd.DataFrame:
     """
     Generate embeddings for the categories
     Parameters
@@ -116,7 +118,9 @@ def generate_category_embeddings(embedding_model: str) -> pd.DataFrame:
         ]
     )
     category_definition_df["embedding"] = get_embeddings(
-        category_definition_df["description"].values, model=embedding_model
+        list_of_text=category_definition_df["description"].values,
+        embedding_model=embedding_model,
+        openai_client=openai_client,
     )
     return category_definition_df
 
@@ -160,10 +164,12 @@ def generate_ast_from_markdown(markdown_file_path: str) -> dict:
     with open(markdown_file_path, "r") as file:
         with AstRenderer() as renderer:
             doc: Document = Document(file.read())
-            return json.loads(renderer.render(doc.ast))
+            return json.loads(renderer.render(doc))
 
 
-def generate_chunks_from_ast(ast: dict, embedding_model: str) -> pd.DataFrame:
+def generate_chunks_from_ast(
+    openai_client: OpenAI, ast: dict, embedding_model: str
+) -> pd.DataFrame:
     """
     Generate chunks from AST
     Parameters
@@ -200,7 +206,9 @@ def generate_chunks_from_ast(ast: dict, embedding_model: str) -> pd.DataFrame:
             chunk_content = ""
     chunks_df: pd.DataFrame = pd.DataFrame(chunks)
     chunks_df["embedding"] = get_embeddings(
-        list_of_text=chunks_df["content"].values, model=embedding_model
+        list_of_text=chunks_df["content"].values,
+        embedding_model=embedding_model,
+        openai_client=openai_client,
     )
     return chunks_df
 
@@ -430,7 +438,7 @@ def scoring_sematic_search_results(
 def scoring_markdown_annual_report(
     markdown_file_path: str,
     embedding_model: str,
-    client: OpenAI,
+    openai_client: OpenAI,
     reasoning_model: str,
     n: int,
 ) -> pd.DataFrame:
@@ -442,7 +450,7 @@ def scoring_markdown_annual_report(
             path to the markdown file
         embedding_model
             model to use for embedding
-        client
+        openai_client
             OpenAI API client
         reasoning_model
             model to use for reasoning
@@ -454,18 +462,19 @@ def scoring_markdown_annual_report(
             result of the scoring
     """
     chunked_document_df: pd.DataFrame = generate_chunks_from_ast(
+        openai_client=openai_client,
         ast=generate_ast_from_markdown(markdown_file_path=markdown_file_path),
         embedding_model=embedding_model,
     )
     category_embeddings_df: pd.DataFrame = generate_category_embeddings(
-        embedding_model=embedding_model
+        openai_client=openai_client, embedding_model=embedding_model
     )
     scoring: list[dict[str, any]] = []
     for category_id in category_embeddings_df["category"].to_list():
         print(f"Scoring category {category_id}")
         scoring.append(
             scoring_sematic_search_results(
-                openai_client=client,
+                openai_client=openai_client,
                 document_df=chunked_document_df,
                 category_df=category_embeddings_df,
                 category_id=category_id,
