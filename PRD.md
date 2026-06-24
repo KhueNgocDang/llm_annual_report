@@ -21,10 +21,13 @@ Vietnamese listed companies publish annual reports and financial data across mul
 5. Convert PDFs to Markdown using `marker-pdf`
 6. Store extracted Markdown content in a DuckDB table with metadata (ticker, year)
 7. Provide a web UI (NiceGUI) to execute and monitor all pipelines
+10. Add RAG + LLM functions to retrieve required scoring/methodology information from `PRD_LLM.md` and `METHODOLOGY.md` for inference and auditability
 
 ## Non-Goals
 
-- PDF summarization or LLM-based analysis (out of scope for v1)
+- Replacing the primary annual report pipeline (stocks, documents, conversion, loading)
+- Building a general-purpose chatbot over all repository files
+- Auto-modifying source methodology documents (`PRD_LLM.md`, `METHODOLOGY.md`) during retrieval
 
 ---
 
@@ -68,6 +71,20 @@ Vietstock Finance API
         │
         ▼
   DuckDB table: annual_reports(ticker, year, content, source_file, created_at)
+
+  Reference Knowledge Sources
+      │
+      ├──► PRD_LLM.md
+      └──► METHODOLOGY.md
+          │
+          ▼
+    [6. Build Reference KB] ── chunk + embed reference docs
+          │
+          ▼
+    [7. Retrieve Required Info] ── top-k semantic retrieval by framework/item/topic
+          │
+          ▼
+    [8. LLM Structured Answer] ── JSON output for downstream inference/prompt construction
 ```
 
 ---
@@ -369,6 +386,130 @@ Implementation:
 - The status table is backed by a reactive list; new rows are appended / updated in-place
 - Log output area at the bottom of each card (collapsible) shows raw log lines
 
+### 6. RAG + LLM Required Information Retrieval (new)
+
+- **Reference files**:
+  - `PRD_LLM.md`
+  - `METHODOLOGY.md`
+- **Purpose**:
+  - Retrieve policy criteria, scoring rules, and methodology instructions required by downstream EDC/PROPER-VN inference.
+  - Standardize how prompts and criteria are sourced so updates in methodology docs are reflected without hardcoding.
+
+#### 6.1 Functional Requirements
+
+- Build a small reference knowledge base (KB) from `PRD_LLM.md` and `METHODOLOGY.md`.
+- Chunk and embed reference text into DuckDB tables for semantic retrieval.
+- Provide deterministic retrieval APIs to fetch required information by:
+  - framework (`EDC`, `PROPER_VN`),
+  - indicator code (`CC1`, `GHG3`, `S1_VIOLATION`, `S2_REDUCTION`, etc.),
+  - methodology topic (`chunking`, `top_k`, `thresholds`, `color_classification`).
+- Provide LLM normalization function to transform retrieved context into strict JSON objects used by inference code.
+- Persist retrieval traces (query, contexts, scores, model, timestamp) for reproducibility and debugging.
+
+#### 6.2 Data Model Additions
+
+```sql
+-- Reference markdown documents used for retrieval
+CREATE TABLE IF NOT EXISTS reference_documents (
+    doc_id        VARCHAR PRIMARY KEY,
+    source_file   VARCHAR NOT NULL,
+    title         VARCHAR,
+    content       VARCHAR NOT NULL,
+    content_hash  VARCHAR NOT NULL,
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Chunked text from reference docs
+CREATE TABLE IF NOT EXISTS reference_chunks (
+    chunk_id      VARCHAR PRIMARY KEY,
+    doc_id        VARCHAR NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    chunk_text    VARCHAR NOT NULL,
+    token_count   INTEGER,
+    FOREIGN KEY (doc_id) REFERENCES reference_documents(doc_id)
+);
+
+-- Embeddings for semantic retrieval over reference docs
+CREATE TABLE IF NOT EXISTS reference_embeddings (
+    chunk_id      VARCHAR PRIMARY KEY,
+    model         VARCHAR NOT NULL,
+    dimensions    INTEGER NOT NULL,
+    embedding     FLOAT[],
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (chunk_id) REFERENCES reference_chunks(chunk_id)
+);
+
+-- Retrieval + generation audit logs
+CREATE TABLE IF NOT EXISTS reference_retrieval_logs (
+    request_id        VARCHAR PRIMARY KEY,
+    query             VARCHAR NOT NULL,
+    framework         VARCHAR,
+    indicator_code    VARCHAR,
+    top_k             INTEGER,
+    embedding_model   VARCHAR,
+    llm_model         VARCHAR,
+    response_json     VARCHAR,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### 6.3 Function Specifications
+
+Module: `rag_reference.py` (new)
+
+1. `build_reference_kb(force_rebuild: bool = False) -> dict`
+   - Reads `PRD_LLM.md` and `METHODOLOGY.md`.
+   - Computes file hashes; skips unchanged files unless `force_rebuild=True`.
+   - Writes/updates `reference_documents`, `reference_chunks`, and `reference_embeddings`.
+   - Returns counts: documents, chunks, embeddings, skipped.
+
+2. `retrieve_required_information(query: str, framework: str | None = None, indicator_code: str | None = None, topic: str | None = None, top_k: int = 5, min_score: float = 0.20) -> list[dict]`
+   - Performs semantic retrieval on `reference_embeddings`.
+   - Supports optional filters by framework/indicator/topic.
+   - Returns ranked contexts: `chunk_id`, `source_file`, `chunk_text`, `similarity_score`.
+
+3. `get_indicator_criteria(indicator_code: str, framework: str) -> dict`
+   - Convenience wrapper for item-specific retrieval.
+   - Must support EDC codes (`CC1..ACC2`) and PROPER-VN codes (`S1_*`, `S2_*`).
+   - Returns strict object:
+     - `indicator_code`
+     - `framework`
+     - `criteria_text`
+     - `scoring_rule`
+     - `source_citations` (list of file + chunk_id + score)
+
+4. `generate_structured_requirement(query: str, contexts: list[dict], llm_model: str = "gpt-4.1-mini") -> dict`
+   - Sends retrieved contexts to LLM.
+   - Enforces JSON-only output with schema validation.
+   - Returns normalized fields for downstream prompts/inference.
+
+5. `retrieve_and_generate_requirement(query: str, framework: str | None = None, indicator_code: str | None = None, top_k: int = 5, llm_model: str = "gpt-4.1-mini") -> dict`
+   - Orchestrates retrieval + LLM generation.
+   - Logs full request/response metadata in `reference_retrieval_logs`.
+   - Returns:
+     - `request_id`
+     - `query`
+     - `contexts`
+     - `answer_json`
+     - `latency_ms`
+
+6. `validate_requirement_coverage(framework: str) -> dict`
+   - Checks whether all required indicators for a framework can be retrieved with confidence.
+   - For `EDC`: validates 18 checklist codes.
+   - For `PROPER_VN`: validates Stage 1 and Stage 2 indicator coverage.
+   - Returns missing/low-confidence indicators and suggested remediation.
+
+#### 6.4 Integration Points
+
+- EDC and PROPER-VN inference modules should call `get_indicator_criteria(...)` instead of hardcoding item descriptions.
+- Prompt builders should use `generate_structured_requirement(...)` output to keep inference prompts aligned with methodology updates.
+- Dashboard should expose a small "Reference Retrieval" tester:
+  - input query,
+  - framework/indicator filters,
+  - retrieved chunks preview,
+  - JSON response preview,
+  - request_id for audit.
+
 ---
 
 ## Directory Structure
@@ -380,8 +521,11 @@ annual_report/
 ├── database.py                # DuckDB schema setup & helpers (ensure_company, etc.)
 ├── financial_data.py          # VNDirect API client: stocks, statements, ratios, models
 ├── vietstock_documents.py     # Vietstock API client: list, download, sync
+├── rag_reference.py           # RAG + LLM retrieval over PRD_LLM.md and METHODOLOGY.md
 ├── pyproject.toml
 ├── PRD.md
+├── PRD_LLM.md
+├── METHODOLOGY.md
 ├── db.db                      # DuckDB database (gitignored)
 ├── data/
 │   ├── raw/                   # Downloaded PDFs by ticker
@@ -411,6 +555,10 @@ annual_report/
 | marker-pdf fails on a PDF | Log error, continue with next file |
 | DuckDB write failure | Log error, continue with next file |
 | Duplicate documents (same file_info_id) | Kept via dedup logic, update existing record |
+| `PRD_LLM.md` or `METHODOLOGY.md` missing | Fail reference KB build with clear error message |
+| Reference embeddings missing for retrieval | Auto-trigger `build_reference_kb()` or return actionable error |
+| Retrieval returns low-confidence or empty contexts | Return structured warning + fallback to keyword match |
+| LLM returns invalid JSON in requirement generation | Retry with strict JSON schema prompt; log failure if still invalid |
 
 ---
 
@@ -516,6 +664,21 @@ Already declared in `pyproject.toml`:
 - [ ] Error summary at end of full pipeline run
 - **Exit criteria**: Full end-to-end pipeline runs from empty state to browsable data in one click
 
+### M18: Reference RAG KB Setup
+- [ ] `rag_reference.py` — implement `build_reference_kb()` for `PRD_LLM.md` and `METHODOLOGY.md`
+- [ ] Create and populate `reference_documents`, `reference_chunks`, `reference_embeddings`
+- **Exit criteria**: Reference KB build reports non-zero chunks and embeddings for both source files
+
+### M19: Retrieval + LLM Requirement Functions
+- [ ] Implement `retrieve_required_information()`, `get_indicator_criteria()`, `generate_structured_requirement()`, `retrieve_and_generate_requirement()`
+- [ ] Add audit logging in `reference_retrieval_logs`
+- **Exit criteria**: Given indicator code (e.g. `GHG3`), system returns JSON criteria with citations from reference docs
+
+### M20: Inference Integration
+- [ ] Update EDC/PROPER-VN inference to consume `get_indicator_criteria()` outputs
+- [ ] Add `validate_requirement_coverage()` preflight check before batch inference
+- **Exit criteria**: Inference can run without hardcoded criteria strings and passes coverage preflight
+
 ---
 
 ## Success Criteria
@@ -533,3 +696,6 @@ Already declared in `pyproject.toml`:
 11. The Financial Data Browser allows browsing statements and ratios per ticker
 12. Re-running the pipeline skips already-synced data where applicable
 13. Individual stages can be triggered independently via the UI buttons
+14. Reference KB is built from `PRD_LLM.md` and `METHODOLOGY.md` with chunk and embedding coverage
+15. System can retrieve required indicator/methodology information via semantic search with citations
+16. Retrieval + LLM function returns schema-valid JSON for downstream inference prompts

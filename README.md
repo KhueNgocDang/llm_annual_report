@@ -2,6 +2,39 @@
 
 Vietnamese stock data & annual report pipeline with NiceGUI web UI.
 
+## Quick Start (LLM flow)
+
+1. Start dashboard:
+
+```bash
+uv run python main.py
+```
+
+2. In Jobs page, run these stages in order for end-to-end LLM evaluation:
+- `8. Load Markdown to DB`
+- `9. Embed Annual Reports`
+- `10. Infer EDC`
+- `11. Infer PROPER-VN`
+- `12. Extract Governance`
+
+## Smoke Commands
+
+Use the smoke CLI for quick validation without the UI:
+
+```bash
+# Embed all loaded reports
+uv run python smoke_llm.py embed-all
+
+# Embed one ticker-year
+uv run python smoke_llm.py embed-one --ticker VNM --year 2024
+
+# Create all inference job types from existing embeddings
+uv run python smoke_llm.py create-jobs
+
+# Run one ticker-year end-to-end inference (EDC + PROPER-VN + governance)
+uv run python smoke_llm.py infer-one --ticker VNM --year 2024
+```
+
 ## Database Schema
 
 `companies` is the central control table. All pipeline operations are scoped to tickers in this table. Deleting a company cascades to all related data.
