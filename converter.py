@@ -560,6 +560,8 @@ def _pdf_needs_ocr(
         total_chars = 0
         for idx in indices:
             text = doc[idx].get_text("text") or ""
+            if not isinstance(text, str):
+                text = str(text)
             total_chars += len(text.strip())
 
         avg_chars = total_chars / pages_to_check
@@ -580,14 +582,22 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
     Returns True if successful, False otherwise.
     """
     row = con.execute(
-        "SELECT id, ticker, year, source_path, output_dir FROM conversion_jobs WHERE id = ?",
+        "SELECT id, ticker, year, source_path, output_dir, force_ocr, rerun_reason FROM conversion_jobs WHERE id = ?",
         [job_id],
     ).fetchone()
 
     if not row:
         return False
 
-    _, ticker, year, source_path, output_dir = row
+    (
+        _,
+        ticker,
+        year,
+        source_path,
+        output_dir,
+        force_ocr_override,
+        rerun_reason,
+    ) = row
 
     # Ensure the source file has a .pdf extension (some downloads have .zip/.rar etc.)
     src = Path(source_path)
@@ -614,11 +624,12 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
 
     # Pre-check: only use force_ocr if the PDF is image-based (no extractable text)
     needs_ocr = _pdf_needs_ocr(source_path)
+    should_force_ocr = bool(force_ocr_override) or needs_ocr
 
     # Append extra marker args from config
     for flag, value in MARKER_EXTRA_ARGS.items():
         # Skip force_ocr if the PDF already has extractable text
-        if flag == "force_ocr" and not needs_ocr:
+        if flag == "force_ocr" and not should_force_ocr:
             continue
         if isinstance(value, bool):
             if value:
@@ -643,8 +654,10 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
         with open(log_path, "w") as log_file:
             log_file.write(f"=== Job #{job_id}: {ticker} {year} ===\n")
             log_file.write(
-                f"OCR mode: {'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
+                f"OCR mode: {'force_ocr (manual override)' if force_ocr_override else 'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
             )
+            if rerun_reason:
+                log_file.write(f"Rerun reason: {rerun_reason}\n")
             log_file.write(f"Command: {cmd_str}\n")
             log_file.write(f"Started: {datetime.now().isoformat()}\n")
             log_file.write("=" * 60 + "\n\n")
@@ -818,14 +831,12 @@ def run_pending_jobs(
     Returns:
         Dict with counts: {"completed": N, "failed": N, "total": N}.
     """
-    rows = con.execute(
-        """
+    rows = con.execute("""
         SELECT id, ticker, year
         FROM conversion_jobs
         WHERE status = 'pending'
         ORDER BY ticker, year
-        """
-    ).fetchall()
+        """).fetchall()
 
     results = {"completed": 0, "failed": 0, "total": len(rows)}
 
@@ -883,26 +894,22 @@ def cancel_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
 
 def reset_failed_jobs(con: duckdb.DuckDBPyConnection) -> int:
     """Reset all failed/cancelled/running jobs back to pending."""
-    row = con.execute(
-        """
+    row = con.execute("""
         SELECT COUNT(*)
         FROM conversion_jobs
         WHERE status IN ('failed', 'cancelled', 'running')
-        """
-    ).fetchone()
+        """).fetchone()
     count = int(row[0]) if row else 0
 
     if count == 0:
         return 0
 
-    con.execute(
-        """
+    con.execute("""
         UPDATE conversion_jobs
         SET status = 'pending', started_at = NULL, completed_at = NULL,
             error_message = NULL, failed_step = NULL, pid = NULL
         WHERE status IN ('failed', 'cancelled', 'running')
-        """
-    )
+        """)
     return count
 
 
@@ -916,13 +923,11 @@ def delete_all_jobs(con: duckdb.DuckDBPyConnection) -> int:
 
 def get_job_summary(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     """Get counts of jobs by status."""
-    rows = con.execute(
-        """
+    rows = con.execute("""
         SELECT status, COUNT(*) AS cnt
         FROM conversion_jobs
         GROUP BY status
-        """
-    ).fetchall()
+        """).fetchall()
 
     summary = {
         "pending": 0,
@@ -937,6 +942,107 @@ def get_job_summary(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return summary
 
 
+def queue_force_ocr_reruns(
+    con: duckdb.DuckDBPyConnection,
+    limit: int | None = None,
+) -> dict[str, int]:
+    """Queue fail-level loaded reports for rerun with a force-OCR override."""
+    query = """
+        SELECT ar.ticker, ar.year, ar.quality_reason
+        FROM annual_reports ar
+        INNER JOIN conversion_jobs cj
+          ON cj.ticker = ar.ticker AND cj.year = ar.year
+        WHERE ar.quality_status = 'fail'
+        ORDER BY
+            ar.suspicious_score DESC NULLS LAST,
+            ar.broken_spacing_pattern_count DESC NULLS LAST,
+            ar.single_char_token_ratio DESC NULLS LAST,
+            ar.ticker,
+            ar.year
+    """
+    if limit is not None:
+        query += " LIMIT ?"
+        rows = con.execute(query, [limit]).fetchall()
+    else:
+        rows = con.execute(query).fetchall()
+
+    queued = 0
+    for ticker, year, quality_reason in rows:
+        updated = con.execute(
+            """
+            UPDATE conversion_jobs
+            SET status = 'pending',
+                force_ocr = TRUE,
+                rerun_reason = COALESCE(NULLIF(?, ''), rerun_reason),
+                error_message = NULL,
+                failed_step = NULL,
+                pid = NULL,
+                started_at = NULL,
+                completed_at = NULL
+            WHERE ticker = ? AND year = ?
+            RETURNING id
+            """,
+            [quality_reason, ticker, year],
+        ).fetchall()
+        queued += len(updated)
+
+    return {"queued": queued, "matched": len(rows)}
+
+
+def queue_force_ocr_high_garbled_reruns(
+    con: duckdb.DuckDBPyConnection,
+    min_garbled_token_count: int = 500,
+    limit: int | None = None,
+) -> dict[str, int]:
+    """Queue loaded reports with high garbled-token counts for force-OCR reruns."""
+    query = """
+        SELECT ar.ticker, ar.year, ar.quality_reason, ar.garbled_vietnamese_token_count
+        FROM annual_reports ar
+        INNER JOIN conversion_jobs cj
+          ON cj.ticker = ar.ticker AND cj.year = ar.year
+        WHERE COALESCE(ar.garbled_vietnamese_token_count, 0) >= ?
+        ORDER BY
+            ar.garbled_vietnamese_token_count DESC NULLS LAST,
+            ar.garbled_vietnamese_token_ratio DESC NULLS LAST,
+            ar.ticker,
+            ar.year
+    """
+    params: list[int] = [min_garbled_token_count]
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = con.execute(query, params).fetchall()
+
+    queued = 0
+    for ticker, year, quality_reason, garbled_count in rows:
+        rerun_reason = (
+            quality_reason or f"high_garbled_token_count:{garbled_count}"
+        )
+        updated = con.execute(
+            """
+            UPDATE conversion_jobs
+            SET status = 'pending',
+                force_ocr = TRUE,
+                rerun_reason = COALESCE(NULLIF(?, ''), rerun_reason),
+                error_message = NULL,
+                failed_step = NULL,
+                pid = NULL,
+                started_at = NULL,
+                completed_at = NULL
+            WHERE ticker = ? AND year = ?
+            RETURNING id
+            """,
+            [rerun_reason, ticker, year],
+        ).fetchall()
+        queued += len(updated)
+
+    return {
+        "queued": queued,
+        "matched": len(rows),
+        "threshold": min_garbled_token_count,
+    }
+
+
 def get_tickers_without_jobs(
     con: duckdb.DuckDBPyConnection,
 ) -> list[dict]:
@@ -945,8 +1051,7 @@ def get_tickers_without_jobs(
     Returns a list of dicts with keys: ticker, doc_count (number of synced
     documents without a matching conversion job).
     """
-    rows = con.execute(
-        """
+    rows = con.execute("""
         SELECT vd.ticker, COUNT(*) AS doc_count
         FROM vietstock_documents vd
         WHERE vd.synced_to_raw = TRUE
@@ -959,7 +1064,6 @@ def get_tickers_without_jobs(
           )
         GROUP BY vd.ticker
         ORDER BY vd.ticker
-        """
-    ).fetchall()
+        """).fetchall()
 
     return [{"ticker": r[0], "doc_count": r[1]} for r in rows]

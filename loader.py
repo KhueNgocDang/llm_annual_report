@@ -11,10 +11,33 @@ import duckdb
 
 from config import OUTPUT_DIR
 from config_marker import MARKDOWN_DIR
+from markdown_quality import score_markdown_quality
 
 logger = logging.getLogger(__name__)
 
 _YEAR_RE = re.compile(r"(20\d{2})")
+
+
+def _annual_report_quality_params(
+    content: str,
+) -> dict[str, float | int | bool | str]:
+    quality = score_markdown_quality(content)
+    return {
+        "quality_suspicious": quality.suspicious,
+        "suspicious_score": quality.suspicious_score,
+        "single_char_token_ratio": quality.single_char_token_ratio,
+        "broken_spacing_pattern_count": quality.broken_spacing_pattern_count,
+        "average_token_length": quality.average_token_length,
+        "isolated_diacritic_token_count": quality.isolated_diacritic_token_count,
+        "garbled_vietnamese_token_count": quality.garbled_vietnamese_token_count,
+        "garbled_vietnamese_token_ratio": quality.garbled_vietnamese_token_ratio,
+        "affected_line_count": quality.affected_line_count,
+        "affected_line_ratio": quality.affected_line_ratio,
+        "affected_region_count": quality.affected_region_count,
+        "quality_status": quality.quality_status,
+        "quality_reason": quality.suspicious_reason,
+        "quality_evidence": quality.quality_evidence,
+    }
 
 
 def _extract_year(text: str) -> int | None:
@@ -36,6 +59,23 @@ def _markdown_source_dirs(
         seen.add(path)
         normalized.append(path)
     return normalized
+
+
+def _resolve_markdown_source_file(source_file: str | Path) -> Path | None:
+    source_path = Path(source_file)
+    if source_path.is_absolute() and source_path.exists():
+        return source_path
+
+    if source_path.exists():
+        return source_path
+
+    for base_dir in _markdown_source_dirs():
+        if source_path.parts and source_path.parts[0] == base_dir.name:
+            candidate = base_dir.parent / source_path
+            if candidate.exists():
+                return candidate
+
+    return None
 
 
 def collect_markdown_files(
@@ -134,6 +174,246 @@ def preview_markdown_sync(
     }
 
 
+def find_suspicious_markdown_files(
+    source_dirs: list[str | Path] | None = None,
+    suspicious_score_threshold: float = 0.45,
+) -> list[dict[str, str | int | float | bool]]:
+    """Score markdown files on disk and return suspicious reports first."""
+    suspicious_entries: list[dict[str, str | int | float | bool]] = []
+
+    for entry in collect_markdown_files(source_dirs=source_dirs):
+        path = Path(str(entry["path"]))
+        content = path.read_text(encoding="utf-8")
+        quality = score_markdown_quality(
+            content,
+            suspicious_score_threshold=suspicious_score_threshold,
+        )
+        if not quality.suspicious:
+            continue
+
+        suspicious_entries.append(
+            {
+                **entry,
+                **quality.to_dict(),
+            }
+        )
+
+    suspicious_entries.sort(
+        key=lambda entry: (
+            float(entry["suspicious_score"]),
+            int(entry["broken_spacing_pattern_count"]),
+            float(entry["single_char_token_ratio"]),
+        ),
+        reverse=True,
+    )
+    return suspicious_entries
+
+
+def audit_annual_report_quality(
+    con: duckdb.DuckDBPyConnection,
+    ticker: str | None = None,
+    year: int | None = None,
+    suspicious_score_threshold: float = 0.45,
+) -> dict[str, int]:
+    """Re-score loaded annual reports and persist quality signals in DuckDB."""
+    query = """
+        SELECT ticker, year, content, source_file
+        FROM annual_reports
+        WHERE 1 = 1
+    """
+    params: list[str | int] = []
+    if ticker:
+        query += " AND ticker = ?"
+        params.append(ticker.upper())
+    if year is not None:
+        query += " AND year = ?"
+        params.append(year)
+    query += " ORDER BY ticker, year"
+
+    rows = con.execute(query, params).fetchall()
+    checked = 0
+    flagged = 0
+    warnings = 0
+    failed = 0
+
+    for report_ticker, report_year, content, source_file in rows:
+        current_content = content
+        if source_file:
+            source_path = _resolve_markdown_source_file(source_file)
+            if source_path is not None:
+                current_content = source_path.read_text(encoding="utf-8")
+
+        quality = score_markdown_quality(
+            current_content,
+            suspicious_score_threshold=suspicious_score_threshold,
+        )
+        if quality.quality_status != "pass":
+            flagged += 1
+        if quality.quality_status == "warning":
+            warnings += 1
+        if quality.quality_status == "fail":
+            failed += 1
+        checked += 1
+        con.execute(
+            """
+            UPDATE annual_reports
+            SET content = ?,
+                quality_checked_at = get_current_timestamp(),
+                quality_suspicious = ?,
+                suspicious_score = ?,
+                single_char_token_ratio = ?,
+                broken_spacing_pattern_count = ?,
+                average_token_length = ?,
+                isolated_diacritic_token_count = ?,
+                garbled_vietnamese_token_count = ?,
+                garbled_vietnamese_token_ratio = ?,
+                affected_line_count = ?,
+                affected_line_ratio = ?,
+                affected_region_count = ?,
+                quality_status = ?,
+                quality_reason = ?,
+                quality_evidence = ?
+            WHERE ticker = ? AND year = ?
+            """,
+            [
+                current_content,
+                quality.quality_status != "pass",
+                quality.suspicious_score,
+                quality.single_char_token_ratio,
+                quality.broken_spacing_pattern_count,
+                quality.average_token_length,
+                quality.isolated_diacritic_token_count,
+                quality.garbled_vietnamese_token_count,
+                quality.garbled_vietnamese_token_ratio,
+                quality.affected_line_count,
+                quality.affected_line_ratio,
+                quality.affected_region_count,
+                quality.quality_status,
+                quality.suspicious_reason,
+                quality.quality_evidence,
+                report_ticker,
+                report_year,
+            ],
+        )
+
+    return {
+        "checked": checked,
+        "flagged": flagged,
+        "warnings": warnings,
+        "failed": failed,
+    }
+
+
+def get_force_ocr_candidates(
+    con: duckdb.DuckDBPyConnection,
+    limit: int | None = None,
+    min_garbled_token_count: int | None = None,
+) -> list[dict[str, str | int | float | bool]]:
+    """Return loaded reports whose quality signals need audit review."""
+    query = """
+        SELECT
+            ar.ticker,
+            ar.year,
+            ar.source_file,
+            ar.suspicious_score,
+            ar.single_char_token_ratio,
+            ar.broken_spacing_pattern_count,
+            ar.average_token_length,
+            ar.isolated_diacritic_token_count,
+            ar.garbled_vietnamese_token_count,
+            ar.garbled_vietnamese_token_ratio,
+            ar.affected_line_count,
+            ar.affected_line_ratio,
+            ar.affected_region_count,
+            ar.quality_status,
+            ar.quality_reason,
+            ar.quality_evidence,
+            cj.status,
+            cj.force_ocr
+        FROM annual_reports ar
+        LEFT JOIN conversion_jobs cj
+          ON cj.ticker = ar.ticker AND cj.year = ar.year
+        WHERE ar.quality_status IS NOT NULL
+    """
+    params: list[int] = []
+    if min_garbled_token_count is not None:
+        query += """
+            AND (
+                ar.quality_status != 'pass'
+                OR COALESCE(ar.garbled_vietnamese_token_count, 0) >= ?
+            )
+        """
+        params.append(min_garbled_token_count)
+    else:
+        query += " AND ar.quality_status != 'pass'"
+
+    query += """
+        ORDER BY
+            CASE ar.quality_status
+                WHEN 'fail' THEN 0
+                WHEN 'warning' THEN 1
+                ELSE 2
+            END,
+            ar.garbled_vietnamese_token_count DESC NULLS LAST,
+            ar.garbled_vietnamese_token_ratio DESC NULLS LAST,
+            ar.suspicious_score DESC NULLS LAST,
+            ar.broken_spacing_pattern_count DESC NULLS LAST,
+            ar.single_char_token_ratio DESC NULLS LAST,
+            ar.ticker,
+            ar.year
+    """
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    rows = con.execute(query, params).fetchall()
+
+    return [
+        {
+            "ticker": ticker,
+            "year": report_year,
+            "source_file": source_file,
+            "suspicious_score": suspicious_score,
+            "single_char_token_ratio": single_char_token_ratio,
+            "broken_spacing_pattern_count": broken_spacing_pattern_count,
+            "average_token_length": average_token_length,
+            "isolated_diacritic_token_count": isolated_diacritic_token_count,
+            "garbled_vietnamese_token_count": garbled_vietnamese_token_count,
+            "garbled_vietnamese_token_ratio": garbled_vietnamese_token_ratio,
+            "affected_line_count": affected_line_count,
+            "affected_line_ratio": affected_line_ratio,
+            "affected_region_count": affected_region_count,
+            "quality_status": quality_status or "pass",
+            "quality_reason": quality_reason or "",
+            "quality_evidence": quality_evidence or "",
+            "job_status": job_status or "missing",
+            "job_force_ocr": (
+                job_force_ocr if job_force_ocr is not None else False
+            ),
+        }
+        for (
+            ticker,
+            report_year,
+            source_file,
+            suspicious_score,
+            single_char_token_ratio,
+            broken_spacing_pattern_count,
+            average_token_length,
+            isolated_diacritic_token_count,
+            garbled_vietnamese_token_count,
+            garbled_vietnamese_token_ratio,
+            affected_line_count,
+            affected_line_ratio,
+            affected_region_count,
+            quality_status,
+            quality_reason,
+            quality_evidence,
+            job_status,
+            job_force_ocr,
+        ) in rows
+    ]
+
+
 def sync_markdown_files(
     con: duckdb.DuckDBPyConnection,
     source_dirs: list[str | Path] | None = None,
@@ -158,20 +438,111 @@ def sync_markdown_files(
         source_file = str(entry["source_file"])
         try:
             content = path.read_text(encoding="utf-8")
+            quality = _annual_report_quality_params(content)
             con.execute(
                 """
-                INSERT INTO annual_reports (ticker, year, content, source_file)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO annual_reports (
+                    ticker,
+                    year,
+                    content,
+                    source_file,
+                    quality_checked_at,
+                    quality_suspicious,
+                    suspicious_score,
+                    single_char_token_ratio,
+                    broken_spacing_pattern_count,
+                    average_token_length,
+                    isolated_diacritic_token_count,
+                    garbled_vietnamese_token_count,
+                    garbled_vietnamese_token_ratio,
+                    affected_line_count,
+                    affected_line_ratio,
+                    affected_region_count,
+                    quality_status,
+                    quality_reason,
+                    quality_evidence
+                )
+                VALUES (
+                    $ticker,
+                    $year,
+                    $content,
+                    $source_file,
+                    get_current_timestamp(),
+                    $quality_suspicious,
+                    $suspicious_score,
+                    $single_char_token_ratio,
+                    $broken_spacing_pattern_count,
+                    $average_token_length,
+                    $isolated_diacritic_token_count,
+                    $garbled_vietnamese_token_count,
+                    $garbled_vietnamese_token_ratio,
+                    $affected_line_count,
+                    $affected_line_ratio,
+                    $affected_region_count,
+                    $quality_status,
+                    $quality_reason,
+                    $quality_evidence
+                )
                 ON CONFLICT (ticker, year) DO UPDATE SET
                     content = EXCLUDED.content,
-                    source_file = EXCLUDED.source_file
+                    source_file = EXCLUDED.source_file,
+                    quality_checked_at = EXCLUDED.quality_checked_at,
+                    quality_suspicious = EXCLUDED.quality_suspicious,
+                    suspicious_score = EXCLUDED.suspicious_score,
+                    single_char_token_ratio = EXCLUDED.single_char_token_ratio,
+                    broken_spacing_pattern_count = EXCLUDED.broken_spacing_pattern_count,
+                    average_token_length = EXCLUDED.average_token_length,
+                    isolated_diacritic_token_count = EXCLUDED.isolated_diacritic_token_count,
+                    garbled_vietnamese_token_count = EXCLUDED.garbled_vietnamese_token_count,
+                    garbled_vietnamese_token_ratio = EXCLUDED.garbled_vietnamese_token_ratio,
+                    affected_line_count = EXCLUDED.affected_line_count,
+                    affected_line_ratio = EXCLUDED.affected_line_ratio,
+                    affected_region_count = EXCLUDED.affected_region_count,
+                    quality_status = EXCLUDED.quality_status,
+                    quality_reason = EXCLUDED.quality_reason,
+                    quality_evidence = EXCLUDED.quality_evidence
                 """,
-                [ticker, year, content, source_file],
+                {
+                    "ticker": ticker,
+                    "year": year,
+                    "content": content,
+                    "source_file": source_file,
+                    "quality_suspicious": quality["quality_suspicious"],
+                    "suspicious_score": quality["suspicious_score"],
+                    "single_char_token_ratio": quality["single_char_token_ratio"],
+                    "broken_spacing_pattern_count": quality[
+                        "broken_spacing_pattern_count"
+                    ],
+                    "average_token_length": quality["average_token_length"],
+                    "isolated_diacritic_token_count": quality[
+                        "isolated_diacritic_token_count"
+                    ],
+                    "garbled_vietnamese_token_count": quality[
+                        "garbled_vietnamese_token_count"
+                    ],
+                    "garbled_vietnamese_token_ratio": quality[
+                        "garbled_vietnamese_token_ratio"
+                    ],
+                    "affected_line_count": quality["affected_line_count"],
+                    "affected_line_ratio": quality["affected_line_ratio"],
+                    "affected_region_count": quality["affected_region_count"],
+                    "quality_status": quality["quality_status"],
+                    "quality_reason": quality["quality_reason"],
+                    "quality_evidence": quality["quality_evidence"],
+                },
             )
             con.execute(
                 """
                 UPDATE conversion_jobs
                 SET status = 'completed',
+                    force_ocr = CASE
+                        WHEN ? THEN TRUE
+                        ELSE force_ocr
+                    END,
+                    rerun_reason = CASE
+                        WHEN ? THEN COALESCE(NULLIF(?, ''), rerun_reason)
+                        ELSE rerun_reason
+                    END,
                     error_message = NULL,
                     failed_step = NULL,
                     pid = NULL,
@@ -179,7 +550,13 @@ def sync_markdown_files(
                     completed_at = COALESCE(completed_at, get_current_timestamp())
                 WHERE ticker = ? AND year = ?
                 """,
-                [ticker, year],
+                [
+                    quality["quality_status"] == "fail",
+                    quality["quality_status"] == "fail",
+                    str(quality["quality_reason"]),
+                    ticker,
+                    year,
+                ],
             )
             counts["loaded"] += 1
             if on_progress:

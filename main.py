@@ -3,19 +3,32 @@
 from __future__ import annotations
 
 import threading
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
+from typing import Callable, TypedDict
 
 from nicegui import ui
 
-from config import DEFAULT_END_YEAR, DEFAULT_START_YEAR
+from config import (
+    DEFAULT_END_YEAR,
+    DEFAULT_START_YEAR,
+    EMBEDDING_CHUNK_SIZE,
+    EMBEDDING_MODEL,
+    INFERENCE_MODEL,
+)
 from converter import (
     list_nonstandard_input_files,
     preview_raw_input_dir_sync,
     resync_input_dir,
 )
-from database import get_connection, init_db, ensure_company, delete_company
+from database import (
+    delete_company,
+    ensure_company,
+    ensure_vss_loaded,
+    get_connection,
+    init_db,
+)
 
 # ---------------------------------------------------------------------------
 # Task state model
@@ -37,6 +50,16 @@ class TaskState:
     last_run: str = ""
     error: str = ""
     progress: float = 0.0
+
+
+class ProcessingStatusRow(TypedDict):
+    ticker: str
+    year: int
+    emb_chunks: int
+    embedded: bool
+    edc_done: bool
+    proper_done: bool
+    gov_done: bool
 
 
 # Global lock to prevent concurrent pipeline runs
@@ -584,6 +607,165 @@ def _make_load(
     return run
 
 
+def _make_embed_reports(
+    state: TaskState,
+    refresh: Callable,
+    *,
+    force: Callable[[], bool] = lambda: False,
+    embedding_model: Callable[[], str] = lambda: EMBEDDING_MODEL,
+    chunk_size: Callable[[], int] = lambda: EMBEDDING_CHUNK_SIZE,
+) -> Callable:
+    def run():
+        from llm_embeddings import embed_all_reports
+
+        con = get_connection()
+        try:
+            init_db(con)
+
+            def on_progress(ticker, year, out, i, total):
+                status = "done"
+                detail = f"{out.get('embedded', 0)} chunks"
+                if out.get("skipped"):
+                    status = "skipped"
+                    detail = out.get("reason", "skipped")
+                if out.get("failed"):
+                    status = "error"
+                    detail = out.get("reason", "failed")
+                state.rows.append(
+                    TaskRow(
+                        label=f"{ticker} / {year}",
+                        detail=str(detail),
+                        status=status,
+                    )
+                )
+                refresh()
+
+            result = embed_all_reports(
+                con,
+                replace=force(),
+                model=embedding_model(),
+                chunk_size=max(1, int(chunk_size())),
+                progress_callback=on_progress,
+            )
+            state.summary = (
+                f"✅ {result['embedded_reports']} embedded, "
+                f"{result['skipped_reports']} skipped, "
+                f"{result['failed_reports']} failed "
+                f"({result['embedded_chunks']:,} chunks)"
+            )
+        finally:
+            con.close()
+
+    return run
+
+
+def _make_infer_edc(
+    state: TaskState,
+    refresh: Callable,
+    *,
+    force: Callable[[], bool] = lambda: False,
+    inference_model: Callable[[], str] = lambda: INFERENCE_MODEL,
+    embedding_model: Callable[[], str] = lambda: EMBEDDING_MODEL,
+) -> Callable:
+    def run():
+        from llm_inference import infer_all
+
+        def on_progress(ticker, year, categories_done, i, total):
+            state.rows.append(
+                TaskRow(
+                    label=f"{ticker} / {year}",
+                    detail=f"{categories_done} categories",
+                    status="done" if categories_done > 0 else "skipped",
+                )
+            )
+            refresh()
+
+        result = infer_all(
+            replace=force(),
+            inference_model=inference_model(),
+            embedding_model=embedding_model(),
+            progress_callback=on_progress,
+        )
+        state.summary = (
+            f"✅ {len(result['evaluated'])} evaluated, "
+            f"{len(result['skipped'])} skipped, "
+            f"{len(result['failed'])} failed"
+        )
+
+    return run
+
+
+def _make_infer_proper_vn(
+    state: TaskState,
+    refresh: Callable,
+    *,
+    force: Callable[[], bool] = lambda: False,
+    inference_model: Callable[[], str] = lambda: INFERENCE_MODEL,
+    embedding_model: Callable[[], str] = lambda: EMBEDDING_MODEL,
+) -> Callable:
+    def run():
+        from llm_proper_vn import infer_proper_vn_all
+
+        def on_progress(ticker, year, color, i, total):
+            state.rows.append(
+                TaskRow(
+                    label=f"{ticker} / {year}",
+                    detail=f"Color: {color}",
+                    status="done" if color != "?" else "error",
+                )
+            )
+            refresh()
+
+        result = infer_proper_vn_all(
+            replace=force(),
+            inference_model=inference_model(),
+            embedding_model=embedding_model(),
+            progress_callback=on_progress,
+        )
+        state.summary = (
+            f"✅ {len(result['evaluated'])} evaluated, "
+            f"{len(result['failed'])} failed"
+        )
+
+    return run
+
+
+def _make_extract_governance(
+    state: TaskState,
+    refresh: Callable,
+    *,
+    force: Callable[[], bool] = lambda: False,
+    inference_model: Callable[[], str] = lambda: INFERENCE_MODEL,
+    embedding_model: Callable[[], str] = lambda: EMBEDDING_MODEL,
+) -> Callable:
+    def run():
+        from llm_governance import extract_governance_all
+
+        def on_progress(ticker, year, n, i, total):
+            state.rows.append(
+                TaskRow(
+                    label=f"{ticker} / {year}",
+                    detail=f"{n} items",
+                    status="done" if n > 0 else "skipped",
+                )
+            )
+            refresh()
+
+        result = extract_governance_all(
+            replace=force(),
+            inference_model=inference_model(),
+            embedding_model=embedding_model(),
+            progress_callback=on_progress,
+        )
+        state.summary = (
+            f"✅ {len(result['evaluated'])} evaluated, "
+            f"{len(result['skipped'])} skipped, "
+            f"{len(result['failed'])} failed"
+        )
+
+    return run
+
+
 # ---------------------------------------------------------------------------
 # Shared navigation header
 # ---------------------------------------------------------------------------
@@ -592,6 +774,8 @@ _NAV_ITEMS = [
     ("Home", "/"),
     ("Companies", "/companies"),
     ("Jobs", "/jobs"),
+    ("LLM Tasks", "/llm-tasks"),
+    ("LLM Query", "/llm-query"),
     ("Converter", "/converter"),
     ("Stocks", "/browse/stocks"),
     ("Financial", "/browse/financial"),
@@ -626,6 +810,10 @@ _PIPELINE_JOBS = [
     ("download", "6. Download PDFs"),
     ("convert", "7. Convert to Markdown"),
     ("load", "8. Load Markdown to DB"),
+    ("embed", "9. Embed Annual Reports"),
+    ("infer_edc", "10. Infer EDC"),
+    ("infer_proper", "11. Infer PROPER-VN"),
+    ("infer_governance", "12. Extract Governance"),
 ]
 
 _ALL_JOBS = _INIT_JOBS + _PIPELINE_JOBS
@@ -789,6 +977,10 @@ def _page_home_content():
                         ("Financial Models", "financial_models"),
                         ("Vietstock Documents", "vietstock_documents"),
                         ("Annual Reports", "annual_reports"),
+                        ("Embeddings", "document_embeddings"),
+                        ("EDC Results", "inference_results"),
+                        ("PROPER-VN Results", "proper_vn_results"),
+                        ("Governance Results", "governance_results"),
                     ]
                     with ui.row().classes("gap-4 flex-wrap"):
                         for label, table in tables:
@@ -986,8 +1178,7 @@ def page_companies():
             def company_table():
                 con = get_connection()
                 try:
-                    rows = con.execute(
-                        """
+                    rows = con.execute("""
                         SELECT
                             c.ticker,
                             s.floor,
@@ -1000,8 +1191,7 @@ def page_companies():
                         FROM companies c
                         LEFT JOIN stocks s ON c.ticker = s.code
                         ORDER BY c.ticker
-                        """
-                    ).fetchall()
+                        """).fetchall()
                 finally:
                     con.close()
 
@@ -1200,6 +1390,34 @@ def page_jobs(
         )
         get_force = lambda: force_toggle.value
 
+        with ui.row().classes("items-end gap-3 flex-wrap w-full"):
+            embed_model_input = (
+                ui.input("Embedding model", value=EMBEDDING_MODEL)
+                .props("dense outlined")
+                .classes("w-56")
+            )
+            infer_model_input = (
+                ui.input("Inference model", value=INFERENCE_MODEL)
+                .props("dense outlined")
+                .classes("w-56")
+            )
+            chunk_size_input = (
+                ui.number(
+                    "Embedding chunk size",
+                    value=EMBEDDING_CHUNK_SIZE,
+                    min=32,
+                    max=8192,
+                    step=32,
+                    format="%.0f",
+                )
+                .props("dense outlined")
+                .classes("w-44")
+            )
+
+        get_embed_model = lambda: (embed_model_input.value or EMBEDDING_MODEL)
+        get_infer_model = lambda: (infer_model_input.value or INFERENCE_MODEL)
+        get_chunk_size = lambda: int(chunk_size_input.value or EMBEDDING_CHUNK_SIZE)
+
         make_fns: dict[str, Callable] = {
             "stocks": lambda s, r: _make_sync_stocks(s, r, force=get_force),
             "models": lambda s, r: _make_sync_models(s, r, force=get_force),
@@ -1219,6 +1437,34 @@ def page_jobs(
                 s, r, start_year=get_sy, end_year=get_ey, force=get_force
             ),
             "load": lambda s, r: _make_load(s, r, force=get_force),
+            "embed": lambda s, r: _make_embed_reports(
+                s,
+                r,
+                force=get_force,
+                embedding_model=get_embed_model,
+                chunk_size=get_chunk_size,
+            ),
+            "infer_edc": lambda s, r: _make_infer_edc(
+                s,
+                r,
+                force=get_force,
+                inference_model=get_infer_model,
+                embedding_model=get_embed_model,
+            ),
+            "infer_proper": lambda s, r: _make_infer_proper_vn(
+                s,
+                r,
+                force=get_force,
+                inference_model=get_infer_model,
+                embedding_model=get_embed_model,
+            ),
+            "infer_governance": lambda s, r: _make_extract_governance(
+                s,
+                r,
+                force=get_force,
+                inference_model=get_infer_model,
+                embedding_model=get_embed_model,
+            ),
         }
 
         for key in job_keys:
@@ -1283,6 +1529,1276 @@ def page_jobs(
                 color="primary",
             )
             ui.button("Back to Home", on_click=lambda: ui.navigate.to("/"))
+
+
+@ui.page("/llm-tasks")
+def page_llm_tasks():
+    ui.dark_mode(False)
+    _nav_header()
+    init_db()
+
+    with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
+        ui.label("LLM Task Manager").classes("text-2xl font-bold")
+        ui.label(
+            "Run embedding and LLM extraction tasks with ticker/year filters."
+        ).classes("text-sm text-gray-600")
+
+        year_now = datetime.now().year
+        year_options = list(range(DEFAULT_START_YEAR, year_now + 1))
+
+        default_embed_models = [
+            EMBEDDING_MODEL,
+            "text-embedding-3-small",
+            "text-embedding-3-large",
+        ]
+        default_infer_models = [
+            INFERENCE_MODEL,
+            "gpt-4.1-mini",
+            "gpt-4.1",
+            "gpt-4o-mini",
+            "gpt-4o",
+            "o3-mini",
+            "o4-mini",
+            "gpt-5-mini",
+        ]
+        EDC_TOTAL = 18
+        PROPER_TOTAL = 7
+        GOV_TOTAL = 5
+
+        ticker_picker_state: dict[str, list[str]] = {"selected": []}
+        model_store_state: dict[str, list[str]] = {
+            "embedding": [],
+            "inference": [],
+        }
+
+        def _ensure_model_presets() -> None:
+            con = get_connection()
+            try:
+                init_db(con)
+                for model in default_embed_models:
+                    con.execute(
+                        """
+                        INSERT INTO llm_model_presets (task_type, model_name, is_active)
+                        VALUES ('embedding', ?, TRUE)
+                        ON CONFLICT (task_type, model_name) DO UPDATE SET is_active = TRUE
+                        """,
+                        [model],
+                    )
+                for model in default_infer_models:
+                    con.execute(
+                        """
+                        INSERT INTO llm_model_presets (task_type, model_name, is_active)
+                        VALUES ('inference', ?, TRUE)
+                        ON CONFLICT (task_type, model_name) DO UPDATE SET is_active = TRUE
+                        """,
+                        [model],
+                    )
+            finally:
+                con.close()
+
+        def _load_model_presets() -> None:
+            con = get_connection()
+            try:
+                init_db(con)
+                emb_rows = con.execute(
+                    "SELECT model_name FROM llm_model_presets "
+                    "WHERE task_type = 'embedding' AND is_active = TRUE "
+                    "ORDER BY created_at, model_name"
+                ).fetchall()
+                inf_rows = con.execute(
+                    "SELECT model_name FROM llm_model_presets "
+                    "WHERE task_type = 'inference' AND is_active = TRUE "
+                    "ORDER BY created_at, model_name"
+                ).fetchall()
+            finally:
+                con.close()
+            model_store_state["embedding"] = [r[0] for r in emb_rows]
+            model_store_state["inference"] = [r[0] for r in inf_rows]
+
+        def _add_model_preset(task_type: str, model_name: str) -> None:
+            value = model_name.strip()
+            if not value:
+                raise ValueError("Model name must not be empty")
+            con = get_connection()
+            try:
+                init_db(con)
+                con.execute(
+                    """
+                    INSERT INTO llm_model_presets (task_type, model_name, is_active)
+                    VALUES (?, ?, TRUE)
+                    ON CONFLICT (task_type, model_name) DO UPDATE SET is_active = TRUE
+                    """,
+                    [task_type, value],
+                )
+            finally:
+                con.close()
+
+        _ensure_model_presets()
+        _load_model_presets()
+
+        with ui.card().classes("w-full"):
+            ui.label("Run Settings").classes("text-lg font-bold")
+
+            with ui.row().classes("items-end gap-3 flex-wrap w-full"):
+                ticker_sel = (
+                    ui.select(
+                        label="Tickers (optional)",
+                        options={},
+                        multiple=True,
+                        with_input=True,
+                    )
+                    .props(
+                        "dense options-dense use-chips outlined "
+                        'style="min-width: 360px"'
+                    )
+                    .classes("flex-1")
+                )
+
+                start_year_input = (
+                    ui.select(
+                        label="Start year",
+                        options=year_options,
+                        value=DEFAULT_START_YEAR,
+                    )
+                    .props("dense outlined")
+                    .classes("w-32")
+                )
+
+                end_year_input = (
+                    ui.select(
+                        label="End year",
+                        options=year_options,
+                        value=DEFAULT_END_YEAR,
+                    )
+                    .props("dense outlined")
+                    .classes("w-32")
+                )
+
+                scope_sel = (
+                    ui.select(
+                        label="Processing scope",
+                        options={
+                            "all": "All reports",
+                            "any_unprocessed": "Any unprocessed stage",
+                            "needs_embedding": "Need embedding",
+                            "needs_edc": "Need EDC",
+                            "needs_proper": "Need PROPER-VN",
+                            "needs_governance": "Need governance",
+                            "fully_processed": "Fully processed",
+                        },
+                        value="all",
+                    )
+                    .props("dense outlined")
+                    .classes("w-60")
+                )
+
+                force_toggle = ui.switch("Force re-run").props("dense")
+
+            ticker_summary = ui.label("").classes("text-xs text-gray-500")
+
+            with ui.tabs().classes("w-full") as setting_tabs:
+                ui.tab("embedding", label="Embedding")
+                ui.tab("inference", label="Inference")
+
+            with ui.tab_panels(setting_tabs, value="embedding").classes("w-full"):
+                with ui.tab_panel("embedding"):
+                    with ui.row().classes("items-end gap-2 flex-wrap"):
+                        embed_model_input = (
+                            ui.select(
+                                label="Embedding model",
+                                options=model_store_state["embedding"],
+                                value=EMBEDDING_MODEL,
+                            )
+                            .props("dense outlined")
+                            .classes("w-56")
+                        )
+                        chunk_size_input = (
+                            ui.number(
+                                "Chunk size",
+                                value=EMBEDDING_CHUNK_SIZE,
+                                min=32,
+                                max=8192,
+                                step=32,
+                                format="%.0f",
+                            )
+                            .props("dense outlined")
+                            .classes("w-32")
+                        )
+                        add_embed_model_input = (
+                            ui.input("Add embedding model")
+                            .props("dense outlined")
+                            .classes("w-56")
+                        )
+                        embed_all_toggle = ui.switch("Embed all available documents")
+                    ui.label(
+                        "When enabled, embedding ignores ticker/year/scope filters and runs for every annual report in the database."
+                    ).classes("text-xs text-gray-500")
+
+                with ui.tab_panel("inference"):
+                    with ui.row().classes("items-end gap-2 flex-wrap"):
+                        infer_model_input = (
+                            ui.select(
+                                label="Inference model",
+                                options=model_store_state["inference"],
+                                value=INFERENCE_MODEL,
+                            )
+                            .props("dense outlined")
+                            .classes("w-56")
+                        )
+                        top_k_input = (
+                            ui.number(
+                                "Top K",
+                                value=5,
+                                min=1,
+                                max=50,
+                                step=1,
+                                format="%.0f",
+                            )
+                            .props("dense outlined")
+                            .classes("w-28")
+                        )
+                        add_infer_model_input = (
+                            ui.input("Add inference model")
+                            .props("dense outlined")
+                            .classes("w-56")
+                        )
+
+            def _refresh_model_selects() -> None:
+                _load_model_presets()
+                embed_model_input.options = model_store_state["embedding"]
+                if embed_model_input.value not in model_store_state["embedding"]:
+                    embed_model_input.value = (
+                        model_store_state["embedding"][0]
+                        if model_store_state["embedding"]
+                        else EMBEDDING_MODEL
+                    )
+                embed_model_input.update()
+
+                infer_model_input.options = model_store_state["inference"]
+                if infer_model_input.value not in model_store_state["inference"]:
+                    infer_model_input.value = (
+                        model_store_state["inference"][0]
+                        if model_store_state["inference"]
+                        else INFERENCE_MODEL
+                    )
+                infer_model_input.update()
+
+            def _add_embed_model() -> None:
+                try:
+                    _add_model_preset("embedding", str(add_embed_model_input.value or ""))
+                    add_embed_model_input.value = ""
+                    _refresh_model_selects()
+                    ui.notify("Embedding model saved")
+                except Exception as exc:
+                    ui.notify(str(exc), type="warning")
+
+            def _add_infer_model() -> None:
+                try:
+                    _add_model_preset("inference", str(add_infer_model_input.value or ""))
+                    add_infer_model_input.value = ""
+                    _refresh_model_selects()
+                    ui.notify("Inference model saved")
+                except Exception as exc:
+                    ui.notify(str(exc), type="warning")
+
+            with ui.row().classes("items-end gap-2 flex-wrap"):
+                ui.button("Save Embedding Model", on_click=_add_embed_model).props(
+                    "dense outline"
+                )
+                ui.button("Save Inference Model", on_click=_add_infer_model).props(
+                    "dense outline"
+                )
+                ui.button("Reload Model Presets", on_click=_refresh_model_selects).props(
+                    "dense outline"
+                )
+
+            def _refresh_tickers() -> None:
+                con = get_connection()
+                try:
+                    rows = con.execute(
+                        "SELECT ticker FROM companies ORDER BY ticker"
+                    ).fetchall()
+                finally:
+                    con.close()
+
+                options = {r[0]: r[0] for r in rows}
+                selected = [
+                    t for t in ticker_picker_state["selected"] if t in options
+                ]
+                ticker_picker_state["selected"] = selected
+                ticker_sel.options = options
+                ticker_sel.value = selected
+                ticker_sel.update()
+                ticker_summary.text = f"{len(options)} tickers available"
+
+            def _sync_selected_tickers(_=None):
+                ticker_picker_state["selected"] = list(ticker_sel.value or [])
+
+            ticker_sel.on_value_change(_sync_selected_tickers)
+
+            with ui.row().classes("gap-2 mt-2"):
+                ui.button("Refresh Tickers", on_click=_refresh_tickers).props(
+                    "dense outline"
+                )
+
+            _refresh_tickers()
+
+        def _selected_tickers() -> list[str] | None:
+            val = list(ticker_sel.value or [])
+            return val or None
+
+        def _selected_years() -> list[int]:
+            sy = int(start_year_input.value or DEFAULT_START_YEAR)
+            ey = int(end_year_input.value or DEFAULT_END_YEAR)
+            if sy > ey:
+                raise ValueError("Start year must be less than or equal to end year")
+            return list(range(sy, ey + 1))
+
+        def _selected_embed_model() -> str:
+            return str(embed_model_input.value or EMBEDDING_MODEL)
+
+        def _selected_infer_model() -> str:
+            return str(infer_model_input.value or INFERENCE_MODEL)
+
+        def _selected_chunk_size() -> int:
+            return max(1, int(chunk_size_input.value or EMBEDDING_CHUNK_SIZE))
+
+        def _selected_top_k() -> int:
+            return max(1, int(top_k_input.value or 5))
+
+        def _selected_scope() -> str:
+            return str(scope_sel.value or "all")
+
+        def _selected_force() -> bool:
+            return bool(force_toggle.value)
+
+        def _selected_embed_all() -> bool:
+            return bool(embed_all_toggle.value)
+
+        def _processing_rows(con) -> list[ProcessingStatusRow]:
+            rows = con.execute(
+                """
+                WITH base AS (
+                    SELECT ticker, year FROM annual_reports
+                ),
+                emb AS (
+                    SELECT ticker, year, COUNT(*) AS c
+                    FROM document_embeddings
+                    WHERE model = ?
+                    GROUP BY ALL
+                ),
+                edc AS (
+                    SELECT ticker, year, COUNT(DISTINCT category_code) AS c
+                    FROM inference_results
+                    WHERE model = ?
+                    GROUP BY ALL
+                ),
+                proper AS (
+                    SELECT ticker, year, COUNT(DISTINCT indicator_code) AS c
+                    FROM proper_vn_results
+                    WHERE model = ?
+                    GROUP BY ALL
+                ),
+                gov AS (
+                    SELECT ticker, year, COUNT(DISTINCT item_code) AS c
+                    FROM governance_results
+                    WHERE model = ?
+                    GROUP BY ALL
+                )
+                SELECT
+                    b.ticker,
+                    b.year,
+                    COALESCE(emb.c, 0) AS emb_chunks,
+                    COALESCE(edc.c, 0) AS edc_count,
+                    COALESCE(proper.c, 0) AS proper_count,
+                    COALESCE(gov.c, 0) AS gov_count
+                FROM base b
+                LEFT JOIN emb ON emb.ticker = b.ticker AND emb.year = b.year
+                LEFT JOIN edc ON edc.ticker = b.ticker AND edc.year = b.year
+                LEFT JOIN proper ON proper.ticker = b.ticker AND proper.year = b.year
+                LEFT JOIN gov ON gov.ticker = b.ticker AND gov.year = b.year
+                ORDER BY b.ticker, b.year
+                """,
+                [
+                    _selected_embed_model(),
+                    _selected_infer_model(),
+                    _selected_infer_model(),
+                    _selected_infer_model(),
+                ],
+            ).fetchall()
+
+            return [
+                {
+                    "ticker": r[0],
+                    "year": int(r[1]),
+                    "emb_chunks": int(r[2]),
+                    "embedded": int(r[2]) > 0,
+                    "edc_done": int(r[3]) >= EDC_TOTAL,
+                    "proper_done": int(r[4]) >= PROPER_TOTAL,
+                    "gov_done": int(r[5]) >= GOV_TOTAL,
+                }
+                for r in rows
+            ]
+
+        def _row_matches_scope(row: ProcessingStatusRow, scope: str) -> bool:
+            embedded = bool(row["embedded"])
+            edc_done = bool(row["edc_done"])
+            proper_done = bool(row["proper_done"])
+            gov_done = bool(row["gov_done"])
+            if scope == "all":
+                return True
+            if scope == "needs_embedding":
+                return not embedded
+            if scope == "needs_edc":
+                return embedded and not edc_done
+            if scope == "needs_proper":
+                return embedded and not proper_done
+            if scope == "needs_governance":
+                return embedded and not gov_done
+            if scope == "fully_processed":
+                return embedded and edc_done and proper_done and gov_done
+            if scope == "any_unprocessed":
+                return not (embedded and edc_done and proper_done and gov_done)
+            return True
+
+        def _target_pairs(con) -> list[tuple[str, int]]:
+            rows = _processing_rows(con)
+            selected_tickers = _selected_tickers()
+            years = set(_selected_years())
+            scope = _selected_scope()
+            filtered = rows
+            if selected_tickers:
+                tset = {t.upper() for t in selected_tickers}
+                filtered = [r for r in filtered if r["ticker"] in tset]
+            filtered = [r for r in filtered if int(r["year"]) in years]
+            filtered = [r for r in filtered if _row_matches_scope(r, scope)]
+            return [(str(r["ticker"]), int(r["year"])) for r in filtered]
+
+        def _all_report_pairs(con) -> list[tuple[str, int]]:
+            rows = con.execute(
+                "SELECT DISTINCT ticker, year FROM annual_reports ORDER BY ticker, year"
+            ).fetchall()
+            return [(str(r[0]), int(r[1])) for r in rows]
+
+        embed_state = TaskState()
+        infer_edc_state = TaskState()
+        infer_proper_state = TaskState()
+        infer_gov_state = TaskState()
+
+        def _filtered_processing_rows() -> list[ProcessingStatusRow]:
+            con = get_connection()
+            try:
+                init_db(con)
+                rows = _processing_rows(con)
+            finally:
+                con.close()
+
+            selected_tickers = _selected_tickers()
+            years = set(_selected_years())
+            scope = _selected_scope()
+            if selected_tickers:
+                tset = {t.upper() for t in selected_tickers}
+                rows = [r for r in rows if r["ticker"] in tset]
+            rows = [r for r in rows if int(r["year"]) in years]
+            rows = [r for r in rows if _row_matches_scope(r, scope)]
+            return rows
+
+        @ui.refreshable
+        def embedding_status_panel():
+            rows = _filtered_processing_rows()
+
+            with ui.card().classes("w-full"):
+                ui.label("Embedding Status by Ticker/Year").classes(
+                    "text-lg font-bold"
+                )
+                if not rows:
+                    ui.label("No rows for current filters").classes("text-gray-500")
+                else:
+                    ui.label(f"{len(rows)} ticker/year rows in scope").classes(
+                        "text-xs text-gray-500"
+                    )
+                    ui.table(
+                        columns=[
+                            {
+                                "name": "ticker",
+                                "label": "Ticker",
+                                "field": "ticker",
+                                "align": "left",
+                            },
+                            {
+                                "name": "year",
+                                "label": "Year",
+                                "field": "year",
+                                "align": "center",
+                            },
+                            {
+                                "name": "chunks",
+                                "label": "Chunks",
+                                "field": "chunks",
+                                "align": "right",
+                            },
+                            {
+                                "name": "embedded",
+                                "label": "Embedded",
+                                "field": "embedded",
+                                "align": "center",
+                            },
+                        ],
+                        rows=[
+                            {
+                                "ticker": r["ticker"],
+                                "year": r["year"],
+                                "chunks": r["emb_chunks"],
+                                "embedded": "✅" if r["embedded"] else "⬜",
+                            }
+                            for r in rows
+                        ],
+                        row_key="ticker_year",
+                    ).classes("w-full").props("dense flat")
+
+            with ui.row().classes("gap-2"):
+                ui.button("Refresh Embedding Status", on_click=embedding_status_panel.refresh).props(
+                    "dense outline"
+                )
+
+        @ui.refreshable
+        def processing_status_panel():
+            rows = _filtered_processing_rows()
+
+            with ui.card().classes("w-full"):
+                ui.label("Processing Status by Ticker/Year").classes(
+                    "text-lg font-bold"
+                )
+                if not rows:
+                    ui.label("No rows for current filters").classes("text-gray-500")
+                else:
+                    ui.label(f"{len(rows)} ticker/year rows in scope").classes(
+                        "text-xs text-gray-500"
+                    )
+                    ui.table(
+                        columns=[
+                            {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
+                            {"name": "year", "label": "Year", "field": "year", "align": "center"},
+                            {"name": "embed", "label": "Embedded", "field": "embed", "align": "center"},
+                            {"name": "edc", "label": "EDC", "field": "edc", "align": "center"},
+                            {"name": "proper", "label": "PROPER", "field": "proper", "align": "center"},
+                            {"name": "gov", "label": "Governance", "field": "gov", "align": "center"},
+                        ],
+                        rows=[
+                            {
+                                "ticker": r["ticker"],
+                                "year": r["year"],
+                                "embed": "✅" if r["embedded"] else "⬜",
+                                "edc": "✅" if r["edc_done"] else "⬜",
+                                "proper": "✅" if r["proper_done"] else "⬜",
+                                "gov": "✅" if r["gov_done"] else "⬜",
+                            }
+                            for r in rows
+                        ],
+                        row_key="ticker_year",
+                    ).classes("w-full").props("dense flat")
+
+            with ui.row().classes("gap-2"):
+                ui.button("Refresh Status", on_click=processing_status_panel.refresh).props(
+                    "dense outline"
+                )
+
+        def _refresh_status_panels() -> None:
+            embedding_status_panel.refresh()
+            processing_status_panel.refresh()
+
+        def _make_llm_embed_task(state: TaskState, refresh: Callable) -> Callable:
+            def run():
+                from llm_embeddings import embed_report
+
+                con = get_connection()
+                try:
+                    init_db(con)
+
+                    pairs = (
+                        _all_report_pairs(con)
+                        if _selected_embed_all()
+                        else _target_pairs(con)
+                    )
+                    if not pairs:
+                        state.summary = "No annual reports match the selected filters"
+                        return
+
+                    embedded_reports = 0
+                    embedded_chunks = 0
+                    skipped_reports = 0
+                    failed_reports = 0
+
+                    for ticker, year in pairs:
+                        try:
+                            out = embed_report(
+                                con,
+                                ticker,
+                                year,
+                                replace=_selected_force(),
+                                model=_selected_embed_model(),
+                                chunk_size=_selected_chunk_size(),
+                            )
+                            status = "done"
+                            detail = f"{out.get('embedded', 0)} chunks"
+                            if out.get("skipped"):
+                                status = "skipped"
+                                detail = out.get("reason", "skipped")
+                                skipped_reports += 1
+                            elif out.get("failed"):
+                                status = "error"
+                                detail = out.get("reason", "failed")
+                                failed_reports += 1
+                            else:
+                                embedded_reports += 1
+                                embedded_chunks += int(out.get("embedded", 0))
+                        except Exception as exc:
+                            status = "error"
+                            detail = str(exc)[:100]
+                            failed_reports += 1
+
+                        state.rows.append(
+                            TaskRow(
+                                label=f"{ticker} / {year}",
+                                detail=str(detail),
+                                status=status,
+                            )
+                        )
+                        refresh()
+
+                    state.summary = (
+                        f"✅ {embedded_reports} embedded, "
+                        f"{skipped_reports} skipped, "
+                        f"{failed_reports} failed "
+                        f"({embedded_chunks:,} chunks)"
+                    )
+                finally:
+                    con.close()
+                _refresh_status_panels()
+
+            return run
+
+        def _make_llm_infer_edc_task(
+            state: TaskState, refresh: Callable
+        ) -> Callable:
+            def run():
+                from llm_inference import infer_report
+
+                con = get_connection()
+                try:
+                    init_db(con)
+                    ensure_vss_loaded(con)
+                    reports = _target_pairs(con)
+                    reports = [
+                        (t, y)
+                        for t, y in reports
+                        if con.execute(
+                            "SELECT 1 FROM document_embeddings "
+                            "WHERE ticker = ? AND year = ? LIMIT 1",
+                            [t, y],
+                        ).fetchone()
+                    ]
+                    if not reports:
+                        state.summary = "No embedded reports match the selected filter"
+                        return
+
+                    ok = 0
+                    fail = 0
+                    skip = 0
+                    for ticker, year in reports:
+                        try:
+                            n = infer_report(
+                                ticker,
+                                year,
+                                con=con,
+                                replace=_selected_force(),
+                                top_k=_selected_top_k(),
+                                inference_model=_selected_infer_model(),
+                                embedding_model=_selected_embed_model(),
+                            )
+                            if n > 0:
+                                status = "done"
+                                detail = f"{n} categories"
+                                ok += 1
+                            else:
+                                status = "skipped"
+                                detail = "no new categories"
+                                skip += 1
+                        except Exception as exc:
+                            status = "error"
+                            detail = str(exc)[:100]
+                            fail += 1
+
+                        state.rows.append(
+                            TaskRow(
+                                label=f"{ticker} / {year}",
+                                detail=detail,
+                                status=status,
+                            )
+                        )
+                        refresh()
+
+                    state.summary = (
+                        f"✅ {ok} evaluated, {skip} skipped, {fail} failed"
+                    )
+                finally:
+                    con.close()
+                _refresh_status_panels()
+
+            return run
+
+        def _make_llm_infer_proper_task(
+            state: TaskState, refresh: Callable
+        ) -> Callable:
+            def run():
+                from llm_proper_vn import infer_proper_vn_report
+
+                con = get_connection()
+                try:
+                    init_db(con)
+                    ensure_vss_loaded(con)
+                    reports = _target_pairs(con)
+                    reports = [
+                        (t, y)
+                        for t, y in reports
+                        if con.execute(
+                            "SELECT 1 FROM document_embeddings "
+                            "WHERE ticker = ? AND year = ? LIMIT 1",
+                            [t, y],
+                        ).fetchone()
+                    ]
+                    if not reports:
+                        state.summary = "No embedded reports match the selected filter"
+                        return
+
+                    ok = 0
+                    fail = 0
+                    for ticker, year in reports:
+                        try:
+                            out = infer_proper_vn_report(
+                                ticker,
+                                year,
+                                con=con,
+                                replace=_selected_force(),
+                                top_k=_selected_top_k(),
+                                inference_model=_selected_infer_model(),
+                                embedding_model=_selected_embed_model(),
+                            )
+                            state.rows.append(
+                                TaskRow(
+                                    label=f"{ticker} / {year}",
+                                    detail=f"Color: {out.get('color', '?')}",
+                                    status="done",
+                                )
+                            )
+                            ok += 1
+                        except Exception as exc:
+                            state.rows.append(
+                                TaskRow(
+                                    label=f"{ticker} / {year}",
+                                    detail=str(exc)[:100],
+                                    status="error",
+                                )
+                            )
+                            fail += 1
+                        refresh()
+
+                    state.summary = f"✅ {ok} evaluated, {fail} failed"
+                finally:
+                    con.close()
+                _refresh_status_panels()
+
+            return run
+
+        def _make_llm_infer_governance_task(
+            state: TaskState, refresh: Callable
+        ) -> Callable:
+            def run():
+                from llm_governance import extract_governance
+
+                con = get_connection()
+                try:
+                    init_db(con)
+                    ensure_vss_loaded(con)
+                    reports = _target_pairs(con)
+                    reports = [
+                        (t, y)
+                        for t, y in reports
+                        if con.execute(
+                            "SELECT 1 FROM document_embeddings "
+                            "WHERE ticker = ? AND year = ? LIMIT 1",
+                            [t, y],
+                        ).fetchone()
+                    ]
+                    if not reports:
+                        state.summary = "No embedded reports match the selected filter"
+                        return
+
+                    ok = 0
+                    fail = 0
+                    skip = 0
+                    for ticker, year in reports:
+                        try:
+                            n = extract_governance(
+                                ticker,
+                                year,
+                                con=con,
+                                replace=_selected_force(),
+                                top_k=_selected_top_k(),
+                                inference_model=_selected_infer_model(),
+                                embedding_model=_selected_embed_model(),
+                            )
+                            if n > 0:
+                                status = "done"
+                                detail = f"{n} items"
+                                ok += 1
+                            else:
+                                status = "skipped"
+                                detail = "no new items"
+                                skip += 1
+                        except Exception as exc:
+                            status = "error"
+                            detail = str(exc)[:100]
+                            fail += 1
+
+                        state.rows.append(
+                            TaskRow(
+                                label=f"{ticker} / {year}",
+                                detail=detail,
+                                status=status,
+                            )
+                        )
+                        refresh()
+
+                    state.summary = (
+                        f"✅ {ok} evaluated, {skip} skipped, {fail} failed"
+                    )
+                finally:
+                    con.close()
+                _refresh_status_panels()
+
+            return run
+
+        @ui.refreshable
+        def embed_panel():
+            task_card(
+                "1. Embed Annual Reports",
+                embed_state,
+                _make_llm_embed_task(embed_state, embed_panel.refresh),
+                embed_panel.refresh,
+            )
+
+        @ui.refreshable
+        def infer_edc_panel():
+            task_card(
+                "2. Infer EDC",
+                infer_edc_state,
+                _make_llm_infer_edc_task(infer_edc_state, infer_edc_panel.refresh),
+                infer_edc_panel.refresh,
+            )
+
+        @ui.refreshable
+        def infer_proper_panel():
+            task_card(
+                "3. Infer PROPER-VN",
+                infer_proper_state,
+                _make_llm_infer_proper_task(
+                    infer_proper_state, infer_proper_panel.refresh
+                ),
+                infer_proper_panel.refresh,
+            )
+
+        @ui.refreshable
+        def infer_gov_panel():
+            task_card(
+                "4. Extract Governance",
+                infer_gov_state,
+                _make_llm_infer_governance_task(
+                    infer_gov_state, infer_gov_panel.refresh
+                ),
+                infer_gov_panel.refresh,
+            )
+
+        with ui.tabs().classes("w-full") as task_tabs:
+            ui.tab("embed_tasks", label="Embedding Tasks")
+            ui.tab("infer_tasks", label="Inference Tasks")
+
+        with ui.tab_panels(task_tabs, value="embed_tasks").classes("w-full"):
+            with ui.tab_panel("embed_tasks"):
+                embedding_status_panel()
+                embed_panel()
+
+            with ui.tab_panel("infer_tasks"):
+                processing_status_panel()
+                infer_edc_panel()
+                infer_proper_panel()
+                infer_gov_panel()
+
+
+@ui.page("/llm-query")
+def page_llm_query():
+    ui.dark_mode(False)
+    _nav_header()
+    init_db()
+
+    with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
+        ui.label("LLM Extracted Items Query").classes("text-2xl font-bold")
+        ui.label(
+            "Query extracted outputs from EDC, PROPER-VN, and Governance pipelines."
+        ).classes("text-sm text-gray-600")
+
+        with ui.card().classes("w-full"):
+            ui.label("Query Filters").classes("text-lg font-bold")
+            with ui.row().classes("items-end gap-3 flex-wrap w-full"):
+                dataset_sel = (
+                    ui.select(
+                        label="Dataset",
+                        options={
+                            "edc": "EDC Results",
+                            "proper": "PROPER-VN Results",
+                            "governance": "Governance Results",
+                        },
+                        value="edc",
+                    )
+                    .props("dense outlined")
+                    .classes("w-56")
+                )
+
+                ticker_input = (
+                    ui.input("Ticker (optional)", placeholder="e.g. AAA")
+                    .props("dense clearable outlined")
+                    .classes("w-40")
+                )
+
+                year_input = (
+                    ui.number(
+                        "Year (optional)",
+                        min=2000,
+                        max=2100,
+                        step=1,
+                        format="%.0f",
+                    )
+                    .props("dense outlined")
+                    .classes("w-32")
+                )
+
+                model_input = (
+                    ui.input("Model (optional)", value=INFERENCE_MODEL)
+                    .props("dense clearable outlined")
+                    .classes("w-56")
+                )
+
+                limit_input = (
+                    ui.number("Limit", value=200, min=1, max=1000, step=1)
+                    .props("dense outlined")
+                    .classes("w-28")
+                )
+
+            ui.button("Run Query", on_click=lambda: query_result_panel.refresh()).props(
+                "dense color=primary"
+            )
+
+        @ui.refreshable
+        def query_result_panel():
+            dataset = str(dataset_sel.value or "edc")
+            ticker = (ticker_input.value or "").strip().upper()
+            year_val = year_input.value
+            model = (model_input.value or "").strip()
+            limit = int(limit_input.value or 200)
+
+            conditions: list[str] = []
+            params: list = []
+            if ticker:
+                conditions.append("ticker = ?")
+                params.append(ticker)
+            if year_val is not None and str(year_val).strip() != "":
+                conditions.append("year = ?")
+                params.append(int(year_val))
+            if model:
+                conditions.append("model = ?")
+                params.append(model)
+
+            where = ""
+            if conditions:
+                where = " WHERE " + " AND ".join(conditions)
+
+            con = get_connection()
+            try:
+                if dataset == "edc":
+                    rows = con.execute(
+                        f"""
+                        SELECT ticker, year, category_code, is_valid, reason, model, created_at
+                        FROM inference_results
+                        {where}
+                        ORDER BY ticker, year DESC, category_code
+                        LIMIT ?
+                        """,
+                        params + [limit],
+                    ).fetchall()
+
+                    columns = [
+                        {
+                            "name": "ticker",
+                            "label": "Ticker",
+                            "field": "ticker",
+                            "align": "left",
+                        },
+                        {
+                            "name": "year",
+                            "label": "Year",
+                            "field": "year",
+                            "align": "center",
+                        },
+                        {
+                            "name": "code",
+                            "label": "Category",
+                            "field": "code",
+                            "align": "left",
+                        },
+                        {
+                            "name": "valid",
+                            "label": "Valid",
+                            "field": "valid",
+                            "align": "center",
+                        },
+                        {
+                            "name": "reason",
+                            "label": "Reason",
+                            "field": "reason",
+                            "align": "left",
+                        },
+                        {
+                            "name": "model",
+                            "label": "Model",
+                            "field": "model",
+                            "align": "left",
+                        },
+                    ]
+                    data = [
+                        {
+                            "id": i,
+                            "ticker": r[0],
+                            "year": r[1],
+                            "code": r[2],
+                            "valid": "1" if r[3] else "0",
+                            "reason": (r[4] or "")[:140],
+                            "model": r[5],
+                            "payload": {
+                                "ticker": r[0],
+                                "year": r[1],
+                                "category_code": r[2],
+                                "is_valid": bool(r[3]),
+                                "reason": r[4],
+                                "model": r[5],
+                                "created_at": str(r[6]),
+                            },
+                        }
+                        for i, r in enumerate(rows)
+                    ]
+                elif dataset == "proper":
+                    rows = con.execute(
+                        f"""
+                        SELECT ticker, year, indicator_code, is_present,
+                               evidence_level, reason, model, created_at
+                        FROM proper_vn_results
+                        {where}
+                        ORDER BY ticker, year DESC, indicator_code
+                        LIMIT ?
+                        """,
+                        params + [limit],
+                    ).fetchall()
+
+                    columns = [
+                        {
+                            "name": "ticker",
+                            "label": "Ticker",
+                            "field": "ticker",
+                            "align": "left",
+                        },
+                        {
+                            "name": "year",
+                            "label": "Year",
+                            "field": "year",
+                            "align": "center",
+                        },
+                        {
+                            "name": "code",
+                            "label": "Indicator",
+                            "field": "code",
+                            "align": "left",
+                        },
+                        {
+                            "name": "present",
+                            "label": "Present",
+                            "field": "present",
+                            "align": "center",
+                        },
+                        {
+                            "name": "level",
+                            "label": "Evidence",
+                            "field": "level",
+                            "align": "left",
+                        },
+                        {
+                            "name": "reason",
+                            "label": "Reason",
+                            "field": "reason",
+                            "align": "left",
+                        },
+                        {
+                            "name": "model",
+                            "label": "Model",
+                            "field": "model",
+                            "align": "left",
+                        },
+                    ]
+                    data = [
+                        {
+                            "id": i,
+                            "ticker": r[0],
+                            "year": r[1],
+                            "code": r[2],
+                            "present": "1" if r[3] else "0",
+                            "level": r[4] or "",
+                            "reason": (r[5] or "")[:140],
+                            "model": r[6],
+                            "payload": {
+                                "ticker": r[0],
+                                "year": r[1],
+                                "indicator_code": r[2],
+                                "is_present": bool(r[3]),
+                                "evidence_level": r[4],
+                                "reason": r[5],
+                                "model": r[6],
+                                "created_at": str(r[7]),
+                            },
+                        }
+                        for i, r in enumerate(rows)
+                    ]
+                else:
+                    rows = con.execute(
+                        f"""
+                        SELECT ticker, year, item_code, found,
+                               value_json, details_json, reason, model, created_at
+                        FROM governance_results
+                        {where}
+                        ORDER BY ticker, year DESC, item_code
+                        LIMIT ?
+                        """,
+                        params + [limit],
+                    ).fetchall()
+
+                    columns = [
+                        {
+                            "name": "ticker",
+                            "label": "Ticker",
+                            "field": "ticker",
+                            "align": "left",
+                        },
+                        {
+                            "name": "year",
+                            "label": "Year",
+                            "field": "year",
+                            "align": "center",
+                        },
+                        {
+                            "name": "code",
+                            "label": "Item",
+                            "field": "code",
+                            "align": "left",
+                        },
+                        {
+                            "name": "found",
+                            "label": "Found",
+                            "field": "found",
+                            "align": "center",
+                        },
+                        {
+                            "name": "reason",
+                            "label": "Reason",
+                            "field": "reason",
+                            "align": "left",
+                        },
+                        {
+                            "name": "model",
+                            "label": "Model",
+                            "field": "model",
+                            "align": "left",
+                        },
+                    ]
+                    data = []
+                    for i, r in enumerate(rows):
+                        try:
+                            value_json = json.loads(r[4]) if r[4] else None
+                        except Exception:
+                            value_json = r[4]
+                        try:
+                            details_json = json.loads(r[5]) if r[5] else []
+                        except Exception:
+                            details_json = r[5]
+
+                        data.append(
+                            {
+                                "id": i,
+                                "ticker": r[0],
+                                "year": r[1],
+                                "code": r[2],
+                                "found": "1" if r[3] else "0",
+                                "reason": (r[6] or "")[:140],
+                                "model": r[7],
+                                "payload": {
+                                    "ticker": r[0],
+                                    "year": r[1],
+                                    "item_code": r[2],
+                                    "found": bool(r[3]),
+                                    "value_json": value_json,
+                                    "details_json": details_json,
+                                    "reason": r[6],
+                                    "model": r[7],
+                                    "created_at": str(r[8]),
+                                },
+                            }
+                        )
+            finally:
+                con.close()
+
+            if not data:
+                ui.label("No extracted items found for current filters").classes(
+                    "text-gray-500"
+                )
+                return
+
+            ui.label(f"{len(data)} row(s)").classes("text-xs text-gray-500")
+            table = (
+                ui.table(
+                    columns=columns,
+                    rows=data,
+                    row_key="id",
+                    selection="single",
+                )
+                .classes("w-full")
+                .props("dense flat")
+            )
+
+            payload_area = ui.code("Select one row, then click View Payload").classes(
+                "w-full max-h-96 overflow-auto text-xs"
+            )
+
+            def _view_payload():
+                selected = table.selected
+                if not selected:
+                    ui.notify("Select one row first", type="warning")
+                    return
+                payload = selected[0].get("payload", {})
+                payload_area.set_content(
+                    json.dumps(payload, indent=2, ensure_ascii=False)
+                )
+
+            ui.button("View Payload", on_click=_view_payload).props(
+                "dense outline"
+            )
+
+        query_result_panel()
 
 
 # ---------------------------------------------------------------------------
@@ -2076,8 +3592,7 @@ def page_converter():
             def create_job_picker():
                 con = get_connection()
                 try:
-                    rows = con.execute(
-                        """
+                    rows = con.execute("""
                         SELECT
                             c.ticker,
                             (
@@ -2095,8 +3610,7 @@ def page_converter():
                             ) AS job_count
                         FROM companies c
                         ORDER BY c.ticker
-                        """
-                    ).fetchall()
+                        """).fetchall()
                 finally:
                     con.close()
 
@@ -2361,7 +3875,10 @@ def page_converter():
                 sync_preview_table.refresh()
 
             def _sync_imported_files():
-                from loader import sync_markdown_files
+                from loader import (
+                    audit_annual_report_quality,
+                    sync_markdown_files,
+                )
 
                 min_year = int(import_min_year.value or DEFAULT_START_YEAR)
                 con = get_connection()
@@ -2369,6 +3886,7 @@ def page_converter():
                     init_db(con)
                     raw_result = resync_input_dir(con=con, min_year=min_year)
                     markdown_result = sync_markdown_files(con)
+                    quality_result = audit_annual_report_quality(con)
                 finally:
                     con.close()
 
@@ -2382,6 +3900,8 @@ def page_converter():
                     f" | Markdown: {markdown_result.get('created_companies', 0)} companies, "
                     f"{markdown_result['loaded']} reports loaded, "
                     f"{markdown_result['failed']} failed"
+                    f" | Quality audit: {quality_result['checked']} checked, "
+                    f"{quality_result['flagged']} flagged"
                 )
                 ui.notify(sync_preview_summary.text)
                 _preview_imported_files()
@@ -2403,6 +3923,349 @@ def page_converter():
             sync_preview_table()
 
         # Resync input directory
+        with ui.card().classes("w-full"):
+            ui.label("Markdown Quality Audit").classes("text-lg font-bold")
+            ui.label(
+                "Audit loaded reports in DuckDB and queue suspicious ones for rerun with a force-OCR override."
+            ).classes("text-sm text-gray-500")
+            audit_task_state = TaskState()
+            audit_rows: list[dict[str, object]] = []
+            garbled_rows: list[dict[str, object]] = []
+            audit_result = {"summary": ""}
+            high_garbled_threshold = ui.number(
+                "High garbled count threshold",
+                value=500,
+                min=1,
+                step=1,
+                format="%.0f",
+            ).props("dense")
+
+            def _load_quality_audit_results() -> None:
+                from loader import (
+                    audit_annual_report_quality,
+                    get_force_ocr_candidates,
+                )
+
+                con = get_connection()
+                try:
+                    init_db(con)
+                    quality_result = audit_annual_report_quality(con)
+                    candidates = get_force_ocr_candidates(
+                        con,
+                        limit=200,
+                        min_garbled_token_count=int(
+                            high_garbled_threshold.value or 500
+                        ),
+                    )
+                finally:
+                    con.close()
+
+                audit_result["summary"] = (
+                    f"Checked {quality_result['checked']} loaded reports | "
+                    f"{quality_result['failed']} fail | "
+                    f"{quality_result['warnings']} warning"
+                )
+                threshold = int(high_garbled_threshold.value or 500)
+                mapped_rows = [
+                    {
+                        "id": f"{row['ticker']}-{row['year']}",
+                        "ticker": row["ticker"],
+                        "year": row["year"],
+                        "status": str(row["quality_status"] or "pass"),
+                        "score": f"{float(row['suspicious_score'] or 0):.3f}",
+                        "ratio": f"{float(row['single_char_token_ratio'] or 0):.3f}",
+                        "spacing": int(
+                            row["broken_spacing_pattern_count"] or 0
+                        ),
+                        "garbled": int(
+                            row["garbled_vietnamese_token_count"] or 0
+                        ),
+                        "garbled_ratio": (
+                            f"{float(row['garbled_vietnamese_token_ratio'] or 0):.4f}"
+                        ),
+                        "affected_lines": int(row["affected_line_count"] or 0),
+                        "affected_regions": int(
+                            row["affected_region_count"] or 0
+                        ),
+                        "affected_ratio": (
+                            f"{float(row['affected_line_ratio'] or 0):.4f}"
+                        ),
+                        "avg_len": f"{float(row['average_token_length'] or 0):.3f}",
+                        "reason": str(row["quality_reason"] or ""),
+                        "evidence": str(row["quality_evidence"] or ""),
+                        "job_status": (
+                            f"{row['job_status']}"
+                            + (" | force_ocr" if row["job_force_ocr"] else "")
+                        ),
+                    }
+                    for row in candidates
+                ]
+                audit_rows.clear()
+                audit_rows.extend(
+                    row for row in mapped_rows if row["status"] != "pass"
+                )
+                garbled_rows.clear()
+                garbled_rows.extend(
+                    row
+                    for row in mapped_rows
+                    if int(row["garbled"]) >= threshold
+                )
+
+            def _refresh_quality_audit() -> None:
+                _load_quality_audit_results()
+
+            def _queue_quality_reruns() -> None:
+                from converter import queue_force_ocr_reruns
+
+                con = get_connection()
+                try:
+                    init_db(con)
+                    result = queue_force_ocr_reruns(con)
+                finally:
+                    con.close()
+
+                audit_task_state.summary = (
+                    f"Queued {result['queued']} force-OCR rerun job(s) "
+                    f"from {result['matched']} fail-level report(s)"
+                )
+                _load_quality_audit_results()
+                jobs_table.refresh()
+
+            def _queue_high_garbled_reruns() -> None:
+                from converter import queue_force_ocr_high_garbled_reruns
+
+                threshold = int(high_garbled_threshold.value or 500)
+                con = get_connection()
+                try:
+                    init_db(con)
+                    result = queue_force_ocr_high_garbled_reruns(
+                        con,
+                        min_garbled_token_count=threshold,
+                    )
+                finally:
+                    con.close()
+
+                audit_task_state.summary = (
+                    f"Queued {result['queued']} force-OCR rerun job(s) "
+                    f"from {result['matched']} report(s) with garbled count >= "
+                    f"{result['threshold']}"
+                )
+                _load_quality_audit_results()
+                jobs_table.refresh()
+
+            @ui.refreshable
+            def audit_panel():
+                if audit_task_state.running:
+                    with ui.row().classes("items-center gap-2"):
+                        ui.spinner(size="sm")
+                        ui.label("Running markdown quality audit...").classes(
+                            "text-sm"
+                        )
+
+                if audit_task_state.error:
+                    ui.label(audit_task_state.error).classes(
+                        "text-red-500 text-sm"
+                    )
+
+                if audit_task_state.summary:
+                    ui.label(audit_task_state.summary).classes(
+                        "text-green-600 text-sm font-medium"
+                    )
+
+                if audit_result["summary"]:
+                    ui.label(audit_result["summary"]).classes("text-sm")
+
+                with ui.row().classes("gap-2 mt-2 flex-wrap"):
+                    ui.button(
+                        "Run Quality Audit",
+                        on_click=lambda: _run_in_thread(
+                            _refresh_quality_audit,
+                            audit_task_state,
+                            audit_panel.refresh,
+                        ),
+                        color="secondary",
+                    ).props("dense")
+                    ui.button(
+                        "Queue Force-OCR Reruns",
+                        on_click=lambda: _run_in_thread(
+                            _queue_quality_reruns,
+                            audit_task_state,
+                            audit_panel.refresh,
+                        ),
+                        color="primary",
+                    ).props("dense")
+                    ui.button(
+                        "Queue High-Garbled Reruns",
+                        on_click=lambda: _run_in_thread(
+                            _queue_high_garbled_reruns,
+                            audit_task_state,
+                            audit_panel.refresh,
+                        ),
+                        color="primary",
+                    ).props("dense")
+
+                if not audit_rows and not garbled_rows:
+                    ui.label(
+                        "No suspicious or high-garbled reports found in the database."
+                    ).classes("text-gray-500 text-sm")
+                    return
+
+                if audit_rows:
+                    ui.label("Suspicious Reports").classes(
+                        "text-sm font-medium mt-3"
+                    )
+                    ui.table(
+                        columns=[
+                            {
+                                "name": "status",
+                                "label": "Status",
+                                "field": "status",
+                                "align": "left",
+                            },
+                            {
+                                "name": "ticker",
+                                "label": "Ticker",
+                                "field": "ticker",
+                                "align": "left",
+                            },
+                            {
+                                "name": "year",
+                                "label": "Year",
+                                "field": "year",
+                                "align": "left",
+                            },
+                            {
+                                "name": "score",
+                                "label": "Score",
+                                "field": "score",
+                                "align": "left",
+                            },
+                            {
+                                "name": "ratio",
+                                "label": "Single-char Ratio",
+                                "field": "ratio",
+                                "align": "left",
+                            },
+                            {
+                                "name": "spacing",
+                                "label": "Broken Spacing",
+                                "field": "spacing",
+                                "align": "left",
+                            },
+                            {
+                                "name": "garbled",
+                                "label": "Garbled Tokens",
+                                "field": "garbled",
+                                "align": "left",
+                            },
+                            {
+                                "name": "affected_lines",
+                                "label": "Affected Lines",
+                                "field": "affected_lines",
+                                "align": "left",
+                            },
+                            {
+                                "name": "affected_regions",
+                                "label": "Regions",
+                                "field": "affected_regions",
+                                "align": "left",
+                            },
+                            {
+                                "name": "affected_ratio",
+                                "label": "Line Ratio",
+                                "field": "affected_ratio",
+                                "align": "left",
+                            },
+                            {
+                                "name": "avg_len",
+                                "label": "Avg Token Len",
+                                "field": "avg_len",
+                                "align": "left",
+                            },
+                            {
+                                "name": "reason",
+                                "label": "Reason",
+                                "field": "reason",
+                                "align": "left",
+                            },
+                            {
+                                "name": "evidence",
+                                "label": "Evidence",
+                                "field": "evidence",
+                                "align": "left",
+                            },
+                            {
+                                "name": "job_status",
+                                "label": "Job",
+                                "field": "job_status",
+                                "align": "left",
+                            },
+                        ],
+                        rows=audit_rows,
+                        row_key="id",
+                    ).classes("w-full").props("dense flat")
+
+                if garbled_rows:
+                    ui.label(
+                        f"High Garbled Reports (count >= {int(high_garbled_threshold.value or 500)})"
+                    ).classes("text-sm font-medium mt-4")
+                    ui.table(
+                        columns=[
+                            {
+                                "name": "ticker",
+                                "label": "Ticker",
+                                "field": "ticker",
+                                "align": "left",
+                            },
+                            {
+                                "name": "year",
+                                "label": "Year",
+                                "field": "year",
+                                "align": "left",
+                            },
+                            {
+                                "name": "status",
+                                "label": "Status",
+                                "field": "status",
+                                "align": "left",
+                            },
+                            {
+                                "name": "garbled",
+                                "label": "Garbled Tokens",
+                                "field": "garbled",
+                                "align": "left",
+                            },
+                            {
+                                "name": "garbled_ratio",
+                                "label": "Garbled Ratio",
+                                "field": "garbled_ratio",
+                                "align": "left",
+                            },
+                            {
+                                "name": "reason",
+                                "label": "Reason",
+                                "field": "reason",
+                                "align": "left",
+                            },
+                            {
+                                "name": "evidence",
+                                "label": "Evidence",
+                                "field": "evidence",
+                                "align": "left",
+                            },
+                            {
+                                "name": "job_status",
+                                "label": "Job",
+                                "field": "job_status",
+                                "align": "left",
+                            },
+                        ],
+                        rows=garbled_rows,
+                        row_key="id",
+                    ).classes("w-full").props("dense flat")
+
+            audit_panel()
+
         with ui.card().classes("w-full"):
             ui.label("Resync Input Directory").classes("text-lg font-bold")
             ui.label(
@@ -2648,15 +4511,13 @@ def page_converter():
                             [status_filter],
                         ).fetchall()
                     else:
-                        rows = con.execute(
-                            """
+                        rows = con.execute("""
                             SELECT id, ticker, year, status, error_message,
                                    failed_step, started_at, completed_at
                             FROM conversion_jobs
                             ORDER BY id DESC
                             LIMIT 200
-                            """
-                        ).fetchall()
+                            """).fetchall()
                 finally:
                     con.close()
 
