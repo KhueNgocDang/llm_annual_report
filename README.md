@@ -53,6 +53,12 @@ uv run python smoke_llm.py rescan-markdown
 
 # Preview only (no DB changes), optionally limited to a ticker/year
 uv run python smoke_llm.py rescan-markdown --preview-only --tickers ASG --years 2025
+
+# Fetch company profile milestones (Moc lich su), store events, and compute firm age
+uv run python smoke_llm.py sync-company-history --ticker SRF
+
+# Run for multiple tickers
+uv run python smoke_llm.py sync-company-history --tickers SRF VNM VJC
 ```
 
 ## Database Schema

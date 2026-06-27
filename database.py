@@ -309,6 +309,27 @@ CREATE TABLE IF NOT EXISTS llm_model_presets (
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (task_type, model_name)
 );
+
+CREATE TABLE IF NOT EXISTS company_history_events (
+    ticker       VARCHAR NOT NULL,
+    event_order  INTEGER NOT NULL,
+    event_year   INTEGER,
+    event_date   VARCHAR,
+    event_text   VARCHAR NOT NULL,
+    section_name VARCHAR,
+    fetched_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, event_order)
+);
+
+CREATE TABLE IF NOT EXISTS company_history_summary (
+    ticker            VARCHAR PRIMARY KEY,
+    first_event_year  INTEGER,
+    first_event_date  VARCHAR,
+    first_event_text  VARCHAR,
+    firm_age          INTEGER,
+    event_count       INTEGER DEFAULT 0,
+    fetched_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 _MIGRATION_SQL = [
@@ -362,6 +383,14 @@ _MIGRATION_SQL = [
     "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS batch_checked_at TIMESTAMP",
     "ALTER TABLE llm_model_presets ADD COLUMN IF NOT EXISTS is_active BOOLEAN",
     "UPDATE llm_model_presets SET is_active = TRUE WHERE is_active IS NULL",
+    "ALTER TABLE company_history_events ADD COLUMN IF NOT EXISTS section_name VARCHAR",
+    "ALTER TABLE company_history_events ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMP",
+    "ALTER TABLE company_history_summary ADD COLUMN IF NOT EXISTS first_event_year INTEGER",
+    "ALTER TABLE company_history_summary ADD COLUMN IF NOT EXISTS first_event_date VARCHAR",
+    "ALTER TABLE company_history_summary ADD COLUMN IF NOT EXISTS first_event_text VARCHAR",
+    "ALTER TABLE company_history_summary ADD COLUMN IF NOT EXISTS firm_age INTEGER",
+    "ALTER TABLE company_history_summary ADD COLUMN IF NOT EXISTS event_count INTEGER",
+    "ALTER TABLE company_history_summary ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMP",
 ]
 
 _INIT_DB_LOCK = threading.Lock()
@@ -459,6 +488,8 @@ def delete_company(
     deleted: dict[str, int] = {}
 
     for table, col in [
+        ("company_history_events", "ticker"),
+        ("company_history_summary", "ticker"),
         ("conversion_jobs", "ticker"),
         ("annual_reports", "ticker"),
         ("pipeline_files", "ticker"),

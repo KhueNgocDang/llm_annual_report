@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from company_history import sync_company_history, sync_company_history_many
 from config import MARKDOWN_DIR, OUTPUT_DIR, ensure_env_loaded
 from database import get_connection, init_db
 from llm_embeddings import embed_all_reports, embed_report
@@ -154,6 +155,33 @@ def cmd_rescan_markdown(args: argparse.Namespace) -> None:
         con.close()
 
 
+def cmd_sync_company_history(args: argparse.Namespace) -> None:
+    con = get_connection()
+    try:
+        init_db(con)
+        if args.ticker:
+            result = sync_company_history(
+                con,
+                ticker=args.ticker,
+                section_name=args.section_name,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return
+
+        tickers = [str(t).strip().upper() for t in (args.tickers or []) if str(t).strip()]
+        if not tickers:
+            raise ValueError("Provide --ticker or --tickers")
+
+        result = sync_company_history_many(
+            con,
+            tickers=tickers,
+            section_name=args.section_name,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    finally:
+        con.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Smoke commands for LLM flows")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -203,6 +231,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print preview only without updating database",
     )
     p_rescan.set_defaults(func=cmd_rescan_markdown)
+
+    p_history = sub.add_parser(
+        "sync-company-history",
+        help="Fetch Vietstock company profile milestones (Moc lich su) and store firm age",
+    )
+    p_history.add_argument("--ticker")
+    p_history.add_argument("--tickers", nargs="*")
+    p_history.add_argument(
+        "--section-name",
+        default="ho-so-doanh-nghiep",
+        help="Vietstock /view section name payload (default: ho-so-doanh-nghiep)",
+    )
+    p_history.set_defaults(func=cmd_sync_company_history)
 
     return parser
 

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import threading
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, TypedDict
 
 from nicegui import ui
@@ -30,6 +32,10 @@ from database import (
     ensure_vss_loaded,
     get_connection,
     init_db,
+)
+from sql_templates import (
+    DATA_STUDIO_SQL_TEMPLATES,
+    DEFAULT_DATA_STUDIO_SQL_TEMPLATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -102,6 +108,7 @@ def _run_in_thread(fn: Callable, state: TaskState, refresh: Callable) -> None:
     state.rows.clear()
     state.summary = ""
     state.error = ""
+    state.progress = 0.0
     refresh()
 
     def _worker():
@@ -111,6 +118,7 @@ def _run_in_thread(fn: Callable, state: TaskState, refresh: Callable) -> None:
             state.error = str(exc)
         finally:
             state.running = False
+            state.progress = 0.0
             state.last_run = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _pipeline_lock.release()
             refresh()
@@ -144,6 +152,11 @@ def task_card(
                 btn.props("dense")
                 if state.running:
                     btn.disable()
+
+        if state.running:
+            ui.linear_progress(value=max(0.0, min(1.0, state.progress))).classes(
+                "w-full"
+            )
 
         if state.error:
             with ui.row().classes("items-center gap-2"):
@@ -985,6 +998,77 @@ def _make_extract_governance(
     return run
 
 
+def _make_sync_company_history(
+    state: TaskState,
+    refresh: Callable,
+    *,
+    ticker_filter: Callable[[], list[str] | None] = lambda: None,
+) -> Callable:
+    def run():
+        from company_history import sync_company_history
+
+        con = get_connection()
+        try:
+            init_db(con)
+
+            selected = ticker_filter() or []
+            if selected:
+                tickers = [str(t).strip().upper() for t in selected if str(t).strip()]
+            else:
+                tickers = [
+                    str(row[0]).upper()
+                    for row in con.execute(
+                        "SELECT ticker FROM companies ORDER BY ticker"
+                    ).fetchall()
+                ]
+
+            if not tickers:
+                state.summary = "No tickers selected and no companies configured"
+                return
+
+            done = 0
+            failed = 0
+            for ticker in tickers:
+                try:
+                    result = sync_company_history(con, ticker=ticker)
+                    first_event = result.get("first_event") or {}
+                    first_year = first_event.get("first_event_year")
+                    firm_age = first_event.get("firm_age")
+                    detail = (
+                        f"{result.get('event_count', 0)} events"
+                        + (
+                            f" | first_year={first_year}" if first_year is not None else ""
+                        )
+                        + (
+                            f" | firm_age={firm_age}" if firm_age is not None else ""
+                        )
+                    )
+                    state.rows.append(
+                        TaskRow(
+                            label=ticker,
+                            detail=detail,
+                            status="done",
+                        )
+                    )
+                    done += 1
+                except Exception as exc:
+                    state.rows.append(
+                        TaskRow(
+                            label=ticker,
+                            detail=str(exc)[:120],
+                            status="error",
+                        )
+                    )
+                    failed += 1
+                refresh()
+
+            state.summary = f"✅ {done} synced, {failed} failed"
+        finally:
+            con.close()
+
+    return run
+
+
 # ---------------------------------------------------------------------------
 # Shared navigation header
 # ---------------------------------------------------------------------------
@@ -993,7 +1077,7 @@ _NAV_ITEMS = [
     ("Home", "/"),
     ("Companies", "/companies"),
     ("Data Studio", "/data-studio"),
-    ("Report Gap", "/report-gap"),
+    ("Company History", "/company-history"),
     ("Extract Items", "/extract-items"),
     ("Jobs", "/jobs"),
     ("LLM Tasks", "/llm-tasks"),
@@ -1036,6 +1120,7 @@ _PIPELINE_JOBS = [
     ("infer_edc", "10. Infer EDC"),
     ("infer_proper", "11. Infer PROPER-VN"),
     ("infer_governance", "12. Extract Governance"),
+    ("company_history", "13. Sync Company History (Moc lich su)"),
 ]
 
 _ALL_JOBS = _INIT_JOBS + _PIPELINE_JOBS
@@ -2381,6 +2466,11 @@ def page_jobs(
                 inference_model=get_infer_model,
                 embedding_model=get_embed_model,
             ),
+            "company_history": lambda s, r: _make_sync_company_history(
+                s,
+                r,
+                ticker_filter=get_tickers,
+            ),
         }
 
         for key in job_keys:
@@ -3174,9 +3264,37 @@ def page_llm_tasks():
                     fetched = 0
                     waiting = 0
                     failed = 0
+                    processed = 0
+
+                    def _begin_step(item_type: str, ticker: str, year: int) -> int:
+                        state.rows.append(
+                            TaskRow(
+                                label=f"{item_type} {ticker} / {year}",
+                                detail="Fetching batch output...",
+                                status="running",
+                            )
+                        )
+                        refresh()
+                        return len(state.rows) - 1
+
+                    def _finish_step(
+                        row_index: int,
+                        status: str,
+                        detail: str,
+                    ) -> None:
+                        nonlocal processed
+                        state.rows[row_index].status = status
+                        state.rows[row_index].detail = detail
+                        processed += 1
+                        state.progress = (
+                            float(processed) / float(total_jobs)
+                            if total_jobs > 0
+                            else 0.0
+                        )
+                        refresh()
 
                     for ticker, year in edc_pairs:
-                        label = f"EDC {ticker} / {year}"
+                        row_idx = _begin_step("EDC", ticker, year)
                         try:
                             n = infer_report(
                                 ticker,
@@ -3208,13 +3326,10 @@ def page_llm_tasks():
                             status = "error"
                             detail = str(exc)[:120]
                             failed += 1
-                        state.rows.append(
-                            TaskRow(label=label, detail=detail, status=status)
-                        )
-                        refresh()
+                        _finish_step(row_idx, status, detail)
 
                     for ticker, year in proper_pairs:
-                        label = f"PROPER {ticker} / {year}"
+                        row_idx = _begin_step("PROPER", ticker, year)
                         try:
                             out = infer_proper_vn_report(
                                 ticker,
@@ -3247,13 +3362,10 @@ def page_llm_tasks():
                             status = "error"
                             detail = str(exc)[:120]
                             failed += 1
-                        state.rows.append(
-                            TaskRow(label=label, detail=detail, status=status)
-                        )
-                        refresh()
+                        _finish_step(row_idx, status, detail)
 
                     for ticker, year in gov_pairs:
-                        label = f"GOV {ticker} / {year}"
+                        row_idx = _begin_step("GOV", ticker, year)
                         try:
                             n = extract_governance(
                                 ticker,
@@ -3285,10 +3397,7 @@ def page_llm_tasks():
                             status = "error"
                             detail = str(exc)[:120]
                             failed += 1
-                        state.rows.append(
-                            TaskRow(label=label, detail=detail, status=status)
-                        )
-                        refresh()
+                        _finish_step(row_idx, status, detail)
 
                     state.summary = (
                         f"Checked {total_jobs} batch job(s): "
@@ -3562,6 +3671,22 @@ def page_llm_tasks():
                 infer_gov_panel.refresh,
             )
 
+        @ui.refreshable
+        def fetch_batch_panel():
+            def _refresh_fetch_batch_views():
+                fetch_batch_panel.refresh()
+                processing_status_panel.refresh()
+
+            task_card(
+                "0. Fetch Batch Outputs",
+                fetch_batch_state,
+                _make_fetch_batch_outputs_task(
+                    fetch_batch_state,
+                    _refresh_fetch_batch_views,
+                ),
+                _refresh_fetch_batch_views,
+            )
+
         with ui.tabs().classes("w-full") as task_tabs:
             ui.tab("embed_tasks", label="Embedding Tasks")
             ui.tab("infer_tasks", label="Inference Tasks")
@@ -3573,15 +3698,7 @@ def page_llm_tasks():
 
             with ui.tab_panel("infer_tasks"):
                 processing_status_panel()
-                task_card(
-                    "0. Fetch Batch Outputs",
-                    fetch_batch_state,
-                    _make_fetch_batch_outputs_task(
-                        fetch_batch_state,
-                        processing_status_panel.refresh,
-                    ),
-                    processing_status_panel.refresh,
-                )
+                fetch_batch_panel()
                 infer_edc_panel()
                 infer_proper_panel()
                 infer_gov_panel()
@@ -3963,245 +4080,695 @@ def page_data_studio():
     with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
         ui.label("Data Studio").classes("text-2xl font-bold")
         ui.label(
-            "Run DuckDB SQL reports on extracted governance data."
+            "Run SQL analytics and monitor annual report gaps."
+        ).classes("text-sm text-gray-600")
+
+        with ui.tabs().classes("w-full") as ds_tabs:
+            ui.tab("sql", label="DuckDB SQL")
+            ui.tab("report_gap", label="Report Gap")
+
+        with ui.tab_panels(ds_tabs, value="sql").classes("w-full"):
+            with ui.tab_panel("sql"):
+                with ui.card().classes("w-full"):
+                    ui.label("DuckDB SQL").classes("text-lg font-bold")
+                    ui.label(
+                        "Run read-only DuckDB queries. Choose a pre-made SQL template from the dropdown and load it into the editor."
+                    ).classes("text-sm text-gray-600")
+
+                    sql_templates: dict[str, str] = DATA_STUDIO_SQL_TEMPLATES
+                    default_template = DEFAULT_DATA_STUDIO_SQL_TEMPLATE
+
+                    sql_state: SqlConsoleState = {
+                        "rows": [],
+                        "columns": [],
+                        "error": "",
+                        "row_count": 0,
+                    }
+
+                    with ui.row().classes("items-end gap-2 flex-wrap w-full"):
+                        template_select = (
+                            ui.select(
+                                options=list(sql_templates.keys()),
+                                value=default_template,
+                                label="SQL Template",
+                            )
+                            .props("dense outlined")
+                            .classes("w-72")
+                        )
+
+                    sql_input = (
+                        ui.textarea(
+                            "SQL",
+                            value=sql_templates[default_template],
+                        )
+                        .props("outlined autogrow")
+                        .classes("w-full")
+                    )
+
+                    def _load_selected_template() -> None:
+                        template_name = str(template_select.value or default_template)
+                        sql_input.value = sql_templates.get(
+                            template_name,
+                            sql_templates[default_template],
+                        )
+                        sql_input.update()
+
+                    def _is_read_only_query(query: str) -> tuple[bool, str]:
+                        q = str(query or "").strip()
+                        if not q:
+                            return False, "Query is empty"
+
+                        # Keep to one statement only.
+                        trimmed = q.rstrip()
+                        if ";" in trimmed.rstrip(";"):
+                            return False, "Only one SQL statement is allowed"
+
+                        lowered = q.lstrip().lower()
+                        allowed_prefixes = (
+                            "select",
+                            "with",
+                            "show",
+                            "describe",
+                            "summarize",
+                            "pragma",
+                            "explain",
+                        )
+                        if not lowered.startswith(allowed_prefixes):
+                            return False, (
+                                "Only read-only SQL is allowed "
+                                "(SELECT/WITH/SHOW/DESCRIBE/SUMMARIZE/PRAGMA/EXPLAIN)"
+                            )
+                        return True, ""
+
+                    @ui.refreshable
+                    def sql_result_panel() -> None:
+                        error = sql_state["error"]
+                        if error:
+                            ui.label(error).classes("text-red-600 text-sm")
+                            return
+
+                        columns = sql_state["columns"]
+                        rows = sql_state["rows"]
+                        row_count = sql_state["row_count"]
+
+                        if not columns:
+                            ui.label("Run a query to see results.").classes(
+                                "text-gray-500 text-sm"
+                            )
+                            return
+
+                        ui.label(f"{row_count} row(s)").classes("text-xs text-gray-500")
+                        ui.table(
+                            columns=columns,
+                            rows=rows,
+                            row_key="_row_id",
+                        ).classes("w-full").props("dense flat")
+
+                    def _run_sql_query() -> None:
+                        query = str(sql_input.value or "").strip()
+                        ok, message = _is_read_only_query(query)
+                        if not ok:
+                            sql_state["error"] = message
+                            sql_state["columns"] = []
+                            sql_state["rows"] = []
+                            sql_state["row_count"] = 0
+                            sql_result_panel.refresh()
+                            return
+
+                        con = get_connection()
+                        try:
+                            cursor = con.execute(query)
+                            description = cursor.description or []
+                            col_names = [str(col[0]) for col in description]
+                            data_rows = cursor.fetchall()
+                        except Exception as exc:
+                            sql_state["error"] = f"Query failed: {exc}"
+                            sql_state["columns"] = []
+                            sql_state["rows"] = []
+                            sql_state["row_count"] = 0
+                            sql_result_panel.refresh()
+                            return
+                        finally:
+                            con.close()
+
+                        table_columns = [
+                            {
+                                "name": col,
+                                "label": col,
+                                "field": col,
+                                "align": "left",
+                            }
+                            for col in col_names
+                        ]
+                        table_rows = [
+                            {
+                                "_row_id": i,
+                                **{
+                                    col_names[j]: (
+                                        "" if value is None else str(value)
+                                    )
+                                    for j, value in enumerate(row)
+                                },
+                            }
+                            for i, row in enumerate(data_rows)
+                        ]
+
+                        sql_state["error"] = ""
+                        sql_state["columns"] = table_columns
+                        sql_state["rows"] = table_rows
+                        sql_state["row_count"] = len(table_rows)
+                        sql_result_panel.refresh()
+
+                    def _export_sql_result_csv() -> None:
+                        rows = sql_state["rows"]
+                        columns = sql_state["columns"]
+                        if not rows or not columns:
+                            ui.notify("Run a query first to export results", type="warning")
+                            return
+
+                        export_dir = Path(OUTPUT_DIR) / "data_studio_exports"
+                        export_dir.mkdir(parents=True, exist_ok=True)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        export_path = export_dir / f"data_studio_query_{timestamp}.csv"
+
+                        field_names = [str(col.get("name") or "") for col in columns]
+                        field_names = [name for name in field_names if name and name != "_row_id"]
+
+                        with export_path.open("w", newline="", encoding="utf-8") as csv_file:
+                            writer = csv.DictWriter(csv_file, fieldnames=field_names)
+                            writer.writeheader()
+                            for row in rows:
+                                writer.writerow({key: str(row.get(key, "")) for key in field_names})
+
+                        ui.notify(f"Exported CSV: {export_path}", type="positive")
+                        ui.download(str(export_path))
+
+                    with ui.row().classes("gap-2"):
+                        ui.button(
+                            "Load SQL Template",
+                            on_click=_load_selected_template,
+                        ).props("dense outline")
+                        ui.button(
+                            "Run DuckDB Query",
+                            on_click=_run_sql_query,
+                            color="primary",
+                        ).props("dense")
+                        ui.button(
+                            "Export Results to CSV",
+                            on_click=_export_sql_result_csv,
+                            color="secondary",
+                        ).props("dense outline")
+                        ui.button(
+                            "Clear Results",
+                            on_click=lambda: (
+                                sql_state.update(
+                                    {
+                                        "rows": [],
+                                        "columns": [],
+                                        "error": "",
+                                        "row_count": 0,
+                                    }
+                                ),
+                                sql_result_panel.refresh(),
+                            ),
+                        ).props("dense outline")
+
+                    sql_result_panel()
+
+            with ui.tab_panel("report_gap"):
+                with ui.column().classes("w-full gap-4"):
+                    ui.label("Annual Report Gap Dashboard").classes("text-lg font-bold")
+                    ui.label(
+                        "Find firms missing their latest expected annual report and queue a rerun for that ticker/year."
+                    ).classes("text-sm text-gray-600")
+
+                    with ui.card().classes("w-full"):
+                        ui.label("Filters").classes("text-lg font-bold")
+                        with ui.row().classes("items-end gap-3 flex-wrap w-full"):
+                            ticker_input = (
+                                ui.input("Ticker contains")
+                                .props("dense clearable outlined")
+                                .classes("w-48")
+                            )
+                            only_missing_toggle = ui.switch(
+                                "Only missing", value=True
+                            ).props("dense")
+                        summary_label = ui.label("").classes("text-sm text-gray-600")
+
+                    @ui.refreshable
+                    def gap_table() -> None:
+                        ticker_filter = (ticker_input.value or "").strip().upper()
+
+                        con = get_connection()
+                        try:
+                            sql = """
+                                WITH all_tickers AS (
+                                    SELECT ticker FROM companies
+                                    UNION
+                                    SELECT DISTINCT ticker FROM annual_reports
+                                    UNION
+                                    SELECT DISTINCT ticker FROM conversion_jobs
+                                    UNION
+                                    SELECT DISTINCT ticker FROM vietstock_documents
+                                ),
+                                doc_years AS (
+                                    SELECT
+                                        ticker,
+                                        MAX(CAST(regexp_extract(title, '(\\d{4})', 1) AS INTEGER)) AS doc_latest_year
+                                    FROM vietstock_documents
+                                    WHERE regexp_extract(title, '(\\d{4})', 1) != ''
+                                    GROUP BY ticker
+                                ),
+                                job_years AS (
+                                    SELECT ticker, MAX(year) AS job_latest_year
+                                    FROM conversion_jobs
+                                    GROUP BY ticker
+                                ),
+                                loaded_years AS (
+                                    SELECT ticker, MAX(year) AS loaded_latest_year
+                                    FROM annual_reports
+                                    GROUP BY ticker
+                                )
+                                SELECT
+                                    t.ticker,
+                                    GREATEST(
+                                        COALESCE(d.doc_latest_year, 0),
+                                        COALESCE(j.job_latest_year, 0)
+                                    ) AS expected_latest_year,
+                                    COALESCE(l.loaded_latest_year, 0) AS loaded_latest_year,
+                                    cj.status AS expected_job_status,
+                                    cj.source_path AS expected_source_path
+                                FROM all_tickers t
+                                LEFT JOIN doc_years d ON d.ticker = t.ticker
+                                LEFT JOIN job_years j ON j.ticker = t.ticker
+                                LEFT JOIN loaded_years l ON l.ticker = t.ticker
+                                LEFT JOIN conversion_jobs cj
+                                  ON cj.ticker = t.ticker
+                                 AND cj.year = GREATEST(
+                                    COALESCE(d.doc_latest_year, 0),
+                                    COALESCE(j.job_latest_year, 0)
+                                 )
+                                WHERE GREATEST(
+                                        COALESCE(d.doc_latest_year, 0),
+                                        COALESCE(j.job_latest_year, 0)
+                                    ) > 0
+                                ORDER BY t.ticker
+                            """
+                            rows = con.execute(sql).fetchall()
+                        finally:
+                            con.close()
+
+                        prepared: list[dict[str, object]] = []
+                        for i, row in enumerate(rows):
+                            ticker = str(row[0])
+                            expected_latest_year = int(row[1] or 0)
+                            loaded_latest_year = int(row[2] or 0)
+                            expected_job_status = str(row[3] or "")
+                            expected_source_path = str(row[4] or "")
+                            is_missing = loaded_latest_year < expected_latest_year
+
+                            if ticker_filter and ticker_filter not in ticker:
+                                continue
+                            if bool(only_missing_toggle.value) and not is_missing:
+                                continue
+
+                            prepared.append(
+                                {
+                                    "id": i,
+                                    "ticker": ticker,
+                                    "expected_year": expected_latest_year,
+                                    "loaded_year": loaded_latest_year if loaded_latest_year > 0 else "",
+                                    "missing": "✅" if is_missing else "",
+                                    "missing_year": expected_latest_year if is_missing else "",
+                                    "job_status": expected_job_status,
+                                    "has_source": "✅" if expected_source_path else "",
+                                    "payload": {
+                                        "ticker": ticker,
+                                        "expected_latest_year": expected_latest_year,
+                                        "loaded_latest_year": loaded_latest_year,
+                                        "missing_year": expected_latest_year,
+                                        "expected_job_status": expected_job_status,
+                                        "expected_source_path": expected_source_path,
+                                        "is_missing": is_missing,
+                                    },
+                                }
+                            )
+
+                        missing_count = sum(1 for row in prepared if row["missing"] == "✅")
+                        summary_label.text = (
+                            f"{len(prepared)} firm(s) shown | {missing_count} firm(s) missing latest expected annual report"
+                        )
+
+                        if not prepared:
+                            ui.label("No firms match current filters").classes("text-gray-500")
+                            return
+
+                        columns = [
+                            {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
+                            {"name": "expected_year", "label": "Expected Latest Year", "field": "expected_year", "align": "center"},
+                            {"name": "loaded_year", "label": "Loaded Latest Year", "field": "loaded_year", "align": "center"},
+                            {"name": "missing", "label": "Missing", "field": "missing", "align": "center"},
+                            {"name": "missing_year", "label": "Rerun Year", "field": "missing_year", "align": "center"},
+                            {"name": "job_status", "label": "Job Status", "field": "job_status", "align": "center"},
+                            {"name": "has_source", "label": "Has Source", "field": "has_source", "align": "center"},
+                            {"name": "action", "label": "", "field": "action", "align": "center"},
+                        ]
+
+                        table = (
+                            ui.table(
+                                columns=columns,
+                                rows=prepared,
+                                row_key="id",
+                                selection="single",
+                            )
+                            .classes("w-full")
+                            .props("dense flat")
+                        )
+
+                        table.add_slot(
+                            "body-cell-action",
+                            r"""
+                            <q-td :props="props">
+                                <q-btn flat dense round icon="refresh" color="primary" size="sm"
+                                       :disable="!props.row.missing_year"
+                                       @click="$parent.$emit('rerun', props.row)" />
+                            </q-td>
+                            """,
+                        )
+
+                        payload_area = ui.code("Select one row, then click View Row").classes(
+                            "w-full max-h-72 overflow-auto text-xs"
+                        )
+
+                        def _view_row_payload() -> None:
+                            selected = table.selected
+                            if not selected:
+                                ui.notify("Select one row first", type="warning")
+                                return
+                            payload = selected[0].get("payload", {})
+                            payload_area.set_content(
+                                json.dumps(payload, indent=2, ensure_ascii=False)
+                            )
+
+                        def _queue_rerun_for_row(row: dict) -> None:
+                            from config_marker import MARKDOWN_DIR
+                            from converter import create_jobs
+
+                            ticker = str(row.get("ticker") or "").upper()
+                            year_val = row.get("missing_year")
+                            if not ticker or not year_val:
+                                ui.notify("Row has no missing year to rerun", type="warning")
+                                return
+
+                            year = int(year_val)
+                            con = get_connection()
+                            try:
+                                init_db(con)
+                                ensure_company(con, ticker)
+
+                                create_jobs(
+                                    con,
+                                    tickers=[ticker],
+                                    years=[year],
+                                    start_year=year,
+                                    end_year=year,
+                                )
+
+                                existing_job = con.execute(
+                                    "SELECT source_path FROM conversion_jobs "
+                                    "WHERE ticker = ? AND year = ?",
+                                    [ticker, year],
+                                ).fetchone()
+
+                                source_path = (
+                                    str(existing_job[0])
+                                    if existing_job and existing_job[0]
+                                    else ""
+                                )
+                                if not source_path:
+                                    doc_row = con.execute(
+                                        """
+                                        SELECT raw_path
+                                        FROM vietstock_documents
+                                        WHERE ticker = ?
+                                          AND synced_to_raw = TRUE
+                                          AND raw_path IS NOT NULL
+                                          AND raw_path != ''
+                                          AND regexp_extract(title, '(\\d{4})', 1) = ?
+                                        ORDER BY published_date DESC
+                                        LIMIT 1
+                                        """,
+                                        [ticker, str(year)],
+                                    ).fetchone()
+                                    source_path = str(doc_row[0]) if doc_row and doc_row[0] else ""
+
+                                if not source_path:
+                                    raise ValueError(
+                                        f"No raw source file found for {ticker}/{year}. Sync or download source PDF first."
+                                    )
+
+                                con.execute(
+                                    """
+                                    INSERT INTO conversion_jobs (
+                                        id, ticker, year, start_year, end_year, source_path, output_dir, status
+                                    ) VALUES (
+                                        nextval('conversion_jobs_id_seq'), ?, ?, ?, ?, ?, ?, 'pending'
+                                    )
+                                    ON CONFLICT (ticker, year) DO UPDATE SET
+                                        source_path = EXCLUDED.source_path,
+                                        output_dir = EXCLUDED.output_dir,
+                                        status = 'pending',
+                                        rerun_reason = ?,
+                                        command = NULL,
+                                        log_path = NULL,
+                                        pid = NULL,
+                                        error_message = NULL,
+                                        failed_step = NULL,
+                                        started_at = NULL,
+                                        completed_at = NULL
+                                    """,
+                                    [
+                                        ticker,
+                                        year,
+                                        year,
+                                        year,
+                                        source_path,
+                                        str(MARKDOWN_DIR),
+                                        f"Manual rerun from report-gap dashboard ({datetime.now().isoformat(timespec='seconds')})",
+                                    ],
+                                )
+
+                                con.execute(
+                                    "DELETE FROM annual_reports WHERE ticker = ? AND year = ?",
+                                    [ticker, year],
+                                )
+                                con.execute(
+                                    "DELETE FROM document_embeddings WHERE ticker = ? AND year = ?",
+                                    [ticker, year],
+                                )
+                                con.execute(
+                                    "DELETE FROM inference_results WHERE ticker = ? AND year = ?",
+                                    [ticker, year],
+                                )
+                                con.execute(
+                                    "DELETE FROM proper_vn_results WHERE ticker = ? AND year = ?",
+                                    [ticker, year],
+                                )
+                                con.execute(
+                                    "DELETE FROM governance_results WHERE ticker = ? AND year = ?",
+                                    [ticker, year],
+                                )
+
+                                con.execute(
+                                    """
+                                    UPDATE inference_jobs
+                                    SET status = 'pending',
+                                        categories_done = 0,
+                                        batch_id = NULL,
+                                        batch_submitted_at = NULL,
+                                        batch_checked_at = NULL,
+                                        started_at = NULL,
+                                        completed_at = NULL,
+                                        error_message = NULL
+                                    WHERE ticker = ? AND year = ?
+                                    """,
+                                    [ticker, year],
+                                )
+                                con.execute(
+                                    """
+                                    UPDATE proper_vn_jobs
+                                    SET status = 'pending',
+                                        indicators_done = 0,
+                                        batch_id = NULL,
+                                        batch_submitted_at = NULL,
+                                        batch_checked_at = NULL,
+                                        color = NULL,
+                                        s2_score = NULL,
+                                        s2_max_score = NULL,
+                                        started_at = NULL,
+                                        completed_at = NULL,
+                                        error_message = NULL
+                                    WHERE ticker = ? AND year = ?
+                                    """,
+                                    [ticker, year],
+                                )
+                                con.execute(
+                                    """
+                                    UPDATE governance_jobs
+                                    SET status = 'pending',
+                                        items_done = 0,
+                                        batch_id = NULL,
+                                        batch_submitted_at = NULL,
+                                        batch_checked_at = NULL,
+                                        started_at = NULL,
+                                        completed_at = NULL,
+                                        error_message = NULL
+                                    WHERE ticker = ? AND year = ?
+                                    """,
+                                    [ticker, year],
+                                )
+                            finally:
+                                con.close()
+
+                            ui.notify(
+                                f"Queued rerun for {ticker}/{year} (convert -> load -> embed -> infer)",
+                                type="positive",
+                            )
+                            gap_table.refresh()
+
+                        table.on("rerun", lambda e: _queue_rerun_for_row(e.args))
+
+                        with ui.row().classes("gap-2"):
+                            ui.button("Refresh", on_click=gap_table.refresh).props("dense outline")
+                            ui.button("View Row", on_click=_view_row_payload).props("dense outline")
+
+                    gap_table()
+
+
+@ui.page("/company-history")
+def page_company_history():
+    ui.dark_mode(False)
+    _nav_header()
+    init_db()
+
+    with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
+        ui.label("Company History").classes("text-2xl font-bold")
+        ui.label(
+            "Fetch and store Moc lich su events from Vietstock profile pages; compute firm age from first event."
         ).classes("text-sm text-gray-600")
 
         with ui.card().classes("w-full"):
-            ui.label("DuckDB SQL").classes("text-lg font-bold")
-            ui.label(
-                "Run read-only DuckDB queries. Choose a pre-made SQL template from the dropdown and load it into the editor."
-            ).classes("text-sm text-gray-600")
+            ui.label("Sync Company History").classes("text-lg font-bold")
 
-            sql_templates: dict[str, str] = {
-                "Governance Board Metrics": (
-                    "WITH base AS (\n"
-                    "    SELECT DISTINCT ticker, year, model\n"
-                    "    FROM governance_results\n"
-                    "),\n"
-                    "dir AS (\n"
-                    "    SELECT ticker, year, model, value_json\n"
-                    "    FROM governance_results\n"
-                    "    WHERE item_code = 'GOV_DIRECTORY'\n"
-                    "),\n"
-                    "exec AS (\n"
-                    "    SELECT ticker, year, model, value_json\n"
-                    "    FROM governance_results\n"
-                    "    WHERE item_code = 'GOV_EXECUTIVE'\n"
-                    "),\n"
-                    "sup AS (\n"
-                    "    SELECT ticker, year, model, value_json\n"
-                    "    FROM governance_results\n"
-                    "    WHERE item_code = 'GOV_SUPERVISORY'\n"
-                    "),\n"
-                    "aud AS (\n"
-                    "    SELECT ticker, year, model, value_json\n"
-                    "    FROM governance_results\n"
-                    "    WHERE item_code = 'GOV_AUDIT'\n"
-                    ")\n"
-                    "SELECT\n"
-                    "    b.ticker,\n"
-                    "    b.year,\n"
-                    "    b.model,\n"
-                    "    TRY_CAST(json_extract_string(d.value_json, '$.women_count') AS INTEGER) AS directory_board_female_members,\n"
-                    "    TRY_CAST(json_extract_string(e.value_json, '$.women_count') AS INTEGER) AS executive_board_female_members,\n"
-                    "    TRY_CAST(json_extract_string(d.value_json, '$.independent_count') AS INTEGER) AS directory_board_independent_members,\n"
-                    "    TRY_CAST(json_extract_string(d.value_json, '$.total_members') AS INTEGER) AS directory_board_size,\n"
-                    "    TRY_CAST(json_extract_string(e.value_json, '$.total_members') AS INTEGER) AS executive_board_size,\n"
-                    "    TRY_CAST(json_extract_string(s.value_json, '$.total_members') AS INTEGER) AS supervisory_board_committee_size,\n"
-                    "    COALESCE(\n"
-                    "        json_extract_string(a.value_json, '$.external_audit_firm'),\n"
-                    "        json_extract_string(a.value_json, '$.external_audit_firm_en')\n"
-                    "    ) AS audit_firm\n"
-                    "FROM base b\n"
-                    "LEFT JOIN dir d ON d.ticker = b.ticker AND d.year = b.year AND d.model = b.model\n"
-                    "LEFT JOIN exec e ON e.ticker = b.ticker AND e.year = b.year AND e.model = b.model\n"
-                    "LEFT JOIN sup s ON s.ticker = b.ticker AND s.year = b.year AND s.model = b.model\n"
-                    "LEFT JOIN aud a ON a.ticker = b.ticker AND a.year = b.year AND a.model = b.model\n"
-                    "ORDER BY b.ticker, b.year DESC, b.model\n"
-                    "LIMIT 200"
-                ),
-                "Latest Governance Results": (
-                    "SELECT ticker, year, item_code, model, created_at\n"
-                    "FROM governance_results\n"
-                    "ORDER BY created_at DESC\n"
-                    "LIMIT 100"
-                ),
-                "Governance Item Coverage": (
-                    "SELECT item_code, COUNT(*) AS rows_count, COUNT(DISTINCT ticker) AS ticker_count\n"
-                    "FROM governance_results\n"
-                    "GROUP BY item_code\n"
-                    "ORDER BY rows_count DESC"
-                ),
-            }
-            default_template = "Governance Board Metrics"
-
-            sql_state: SqlConsoleState = {
-                "rows": [],
-                "columns": [],
-                "error": "",
-                "row_count": 0,
-            }
-
-            with ui.row().classes("items-end gap-2 flex-wrap w-full"):
-                template_select = (
-                    ui.select(
-                        options=list(sql_templates.keys()),
-                        value=default_template,
-                        label="SQL Template",
+            with ui.row().classes("items-end gap-3 flex-wrap w-full"):
+                ticker_input = (
+                    ui.input(
+                        "Tickers",
+                        placeholder="SRF,VNM or newline-separated",
+                        value="",
                     )
-                    .props("dense outlined")
-                    .classes("w-72")
+                    .props("dense outlined clearable")
+                    .classes("w-80")
                 )
 
-            sql_input = (
-                ui.textarea(
-                    "SQL",
-                    value=sql_templates[default_template],
-                )
-                .props("outlined autogrow")
-                .classes("w-full")
-            )
-
-            def _load_selected_template() -> None:
-                template_name = str(template_select.value or default_template)
-                sql_input.value = sql_templates.get(
-                    template_name,
-                    sql_templates[default_template],
-                )
-                sql_input.update()
-
-            def _is_read_only_query(query: str) -> tuple[bool, str]:
-                q = str(query or "").strip()
-                if not q:
-                    return False, "Query is empty"
-
-                # Keep to one statement only.
-                trimmed = q.rstrip()
-                if ";" in trimmed.rstrip(";"):
-                    return False, "Only one SQL statement is allowed"
-
-                lowered = q.lstrip().lower()
-                allowed_prefixes = (
-                    "select",
-                    "with",
-                    "show",
-                    "describe",
-                    "summarize",
-                    "pragma",
-                    "explain",
-                )
-                if not lowered.startswith(allowed_prefixes):
-                    return False, (
-                        "Only read-only SQL is allowed "
-                        "(SELECT/WITH/SHOW/DESCRIBE/SUMMARIZE/PRAGMA/EXPLAIN)"
-                    )
-                return True, ""
+            sync_summary = ui.label("").classes("text-sm text-gray-600")
 
             @ui.refreshable
-            def sql_result_panel() -> None:
-                error = sql_state["error"]
-                if error:
-                    ui.label(error).classes("text-red-600 text-sm")
-                    return
-
-                columns = sql_state["columns"]
-                rows = sql_state["rows"]
-                row_count = sql_state["row_count"]
-
-                if not columns:
-                    ui.label("Run a query to see results.").classes(
-                        "text-gray-500 text-sm"
-                    )
-                    return
-
-                ui.label(f"{row_count} row(s)").classes("text-xs text-gray-500")
-                ui.table(
-                    columns=columns,
-                    rows=rows,
-                    row_key="_row_id",
-                ).classes("w-full").props("dense flat")
-
-            def _run_sql_query() -> None:
-                query = str(sql_input.value or "").strip()
-                ok, message = _is_read_only_query(query)
-                if not ok:
-                    sql_state["error"] = message
-                    sql_state["columns"] = []
-                    sql_state["rows"] = []
-                    sql_state["row_count"] = 0
-                    sql_result_panel.refresh()
-                    return
+            def history_summary_table() -> None:
+                ticker_filter = _normalize_ticker_list(str(ticker_input.value or ""))
 
                 con = get_connection()
                 try:
-                    cursor = con.execute(query)
-                    description = cursor.description or []
-                    col_names = [str(col[0]) for col in description]
-                    data_rows = cursor.fetchall()
+                    sql = """
+                        SELECT ticker, first_event_year, first_event_date, first_event_text, firm_age, event_count, fetched_at
+                        FROM company_history_summary
+                    """
+                    params: list = []
+                    if ticker_filter:
+                        placeholders = ", ".join(["?"] * len(ticker_filter))
+                        sql += f" WHERE ticker IN ({placeholders})"
+                        params.extend([t.upper() for t in ticker_filter])
+                    sql += " ORDER BY ticker"
+                    rows = con.execute(sql, params).fetchall()
+                finally:
+                    con.close()
+
+                if not rows:
+                    ui.label("No company history summary rows found.").classes("text-gray-500")
+                    return
+
+                ui.table(
+                    columns=[
+                        {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
+                        {"name": "first_year", "label": "First Year", "field": "first_year", "align": "center"},
+                        {"name": "firm_age", "label": "Firm Age", "field": "firm_age", "align": "center"},
+                        {"name": "event_count", "label": "Events", "field": "event_count", "align": "center"},
+                        {"name": "first_event", "label": "First Event", "field": "first_event", "align": "left"},
+                        {"name": "fetched_at", "label": "Fetched At", "field": "fetched_at", "align": "left"},
+                    ],
+                    rows=[
+                        {
+                            "id": i,
+                            "ticker": r[0],
+                            "first_year": r[1] if r[1] is not None else "",
+                            "firm_age": r[4] if r[4] is not None else "",
+                            "event_count": r[5] if r[5] is not None else 0,
+                            "first_event": (r[3] or "")[:120],
+                            "fetched_at": str(r[6]) if r[6] is not None else "",
+                        }
+                        for i, r in enumerate(rows)
+                    ],
+                    row_key="id",
+                ).classes("w-full").props("dense flat")
+
+            def _run_history_sync() -> None:
+                from company_history import sync_company_history, sync_company_history_many
+
+                tickers = _normalize_ticker_list(str(ticker_input.value or ""))
+
+                con = get_connection()
+                try:
+                    init_db(con)
+                    if tickers:
+                        results = sync_company_history_many(con, tickers=tickers)
+                    else:
+                        company_rows = con.execute(
+                            "SELECT ticker FROM companies ORDER BY ticker"
+                        ).fetchall()
+                        all_tickers = [str(row[0]).upper() for row in company_rows]
+                        if not all_tickers:
+                            ui.notify("No tickers in companies table", type="warning")
+                            return
+                        results = [
+                            sync_company_history(con, ticker=ticker)
+                            for ticker in all_tickers
+                        ]
                 except Exception as exc:
-                    sql_state["error"] = f"Query failed: {exc}"
-                    sql_state["columns"] = []
-                    sql_state["rows"] = []
-                    sql_state["row_count"] = 0
-                    sql_result_panel.refresh()
+                    ui.notify(f"Company history sync failed: {exc}", type="negative")
                     return
                 finally:
                     con.close()
 
-                table_columns = [
-                    {
-                        "name": col,
-                        "label": col,
-                        "field": col,
-                        "align": "left",
-                    }
-                    for col in col_names
-                ]
-                table_rows = [
-                    {
-                        "_row_id": i,
-                        **{
-                            col_names[j]: (
-                                "" if value is None else str(value)
-                            )
-                            for j, value in enumerate(row)
-                        },
-                    }
-                    for i, row in enumerate(data_rows)
-                ]
-
-                sql_state["error"] = ""
-                sql_state["columns"] = table_columns
-                sql_state["rows"] = table_rows
-                sql_state["row_count"] = len(table_rows)
-                sql_result_panel.refresh()
+                synced = len(results)
+                with_events = sum(1 for r in results if int(r.get("event_count", 0)) > 0)
+                sync_summary.text = (
+                    f"Synced {synced} ticker(s) | {with_events} ticker(s) with events"
+                )
+                ui.notify(sync_summary.text, type="positive")
+                history_summary_table.refresh()
 
             with ui.row().classes("gap-2"):
                 ui.button(
-                    "Load SQL Template",
-                    on_click=_load_selected_template,
-                ).props("dense outline")
-                ui.button(
-                    "Run DuckDB Query",
-                    on_click=_run_sql_query,
+                    "Run Company History Sync",
+                    on_click=_run_history_sync,
                     color="primary",
                 ).props("dense")
                 ui.button(
-                    "Clear Results",
-                    on_click=lambda: (
-                        sql_state.update(
-                            {
-                                "rows": [],
-                                "columns": [],
-                                "error": "",
-                                "row_count": 0,
-                            }
-                        ),
-                        sql_result_panel.refresh(),
-                    ),
+                    "Refresh Summary",
+                    on_click=history_summary_table.refresh,
                 ).props("dense outline")
 
-            sql_result_panel()
+            history_summary_table()
 
 
 @ui.page("/extract-items")
@@ -4558,6 +5125,9 @@ def page_extract_items():
 
 @ui.page("/report-gap")
 def page_report_gap():
+    ui.navigate.to("/data-studio")
+    return
+
     ui.dark_mode(False)
     _nav_header()
     init_db()
@@ -6857,6 +7427,127 @@ def page_converter():
             ui.label("Run & Manage").classes("text-lg font-bold")
 
             converter_state = TaskState()
+            rerun_picker_state: dict[str, list[int]] = {"years": []}
+
+            with ui.row().classes("items-end gap-3 flex-wrap w-full"):
+                rerun_ticker_select = (
+                    ui.select(
+                        label="Rerun Ticker",
+                        options={},
+                        with_input=True,
+                    )
+                    .props('dense outlined style="min-width: 220px"')
+                    .classes("w-64")
+                )
+                rerun_year_select = (
+                    ui.select(
+                        label="Rerun Year",
+                        options=[],
+                    )
+                    .props("dense outlined")
+                    .classes("w-40")
+                )
+                ui.label(
+                    "Queues one conversion rerun and removes existing markdown output for this ticker/year first."
+                ).classes("text-xs text-gray-500")
+
+            def _refresh_rerun_picker() -> None:
+                con = get_connection()
+                try:
+                    rows = con.execute(
+                        """
+                        WITH candidates AS (
+                            SELECT ticker, year
+                            FROM conversion_jobs
+                            WHERE source_path IS NOT NULL AND source_path != ''
+                            UNION
+                            SELECT
+                                ticker,
+                                TRY_CAST(regexp_extract(title, '(\\d{4})', 1) AS INTEGER) AS year
+                            FROM vietstock_documents
+                            WHERE synced_to_raw = TRUE
+                              AND raw_path IS NOT NULL
+                              AND raw_path != ''
+                        )
+                        SELECT ticker, year
+                        FROM candidates
+                        WHERE year IS NOT NULL
+                        ORDER BY ticker, year DESC
+                        """
+                    ).fetchall()
+                finally:
+                    con.close()
+
+                ticker_years: dict[str, list[int]] = {}
+                for ticker, year in rows:
+                    ticker_key = str(ticker or "").upper()
+                    if not ticker_key or year is None:
+                        continue
+                    ticker_years.setdefault(ticker_key, [])
+                    yr = int(year)
+                    if yr not in ticker_years[ticker_key]:
+                        ticker_years[ticker_key].append(yr)
+
+                for years in ticker_years.values():
+                    years.sort(reverse=True)
+
+                ticker_options = {
+                    ticker: f"{ticker} ({len(years)} year{'s' if len(years) != 1 else ''})"
+                    for ticker, years in sorted(ticker_years.items())
+                }
+                selected_ticker = str(rerun_ticker_select.value or "").upper()
+                if selected_ticker not in ticker_options and ticker_options:
+                    selected_ticker = next(iter(ticker_options.keys()))
+
+                rerun_ticker_select.options = ticker_options
+                rerun_ticker_select.value = selected_ticker or None
+                rerun_ticker_select.update()
+
+                years = ticker_years.get(selected_ticker, [])
+                rerun_picker_state["years"] = years
+                selected_year = rerun_year_select.value
+                if selected_year not in years:
+                    selected_year = years[0] if years else None
+                rerun_year_select.options = years
+                rerun_year_select.value = selected_year
+                rerun_year_select.update()
+
+            def _on_rerun_ticker_change(_=None) -> None:
+                ticker = str(rerun_ticker_select.value or "").upper()
+                con = get_connection()
+                try:
+                    rows = con.execute(
+                        """
+                        WITH candidates AS (
+                            SELECT ticker, year
+                            FROM conversion_jobs
+                            WHERE source_path IS NOT NULL AND source_path != ''
+                            UNION
+                            SELECT
+                                ticker,
+                                TRY_CAST(regexp_extract(title, '(\\d{4})', 1) AS INTEGER) AS year
+                            FROM vietstock_documents
+                            WHERE synced_to_raw = TRUE
+                              AND raw_path IS NOT NULL
+                              AND raw_path != ''
+                        )
+                        SELECT year
+                        FROM candidates
+                        WHERE ticker = ? AND year IS NOT NULL
+                        ORDER BY year DESC
+                        """,
+                        [ticker],
+                    ).fetchall()
+                finally:
+                    con.close()
+
+                years = sorted({int(row[0]) for row in rows if row[0] is not None}, reverse=True)
+                rerun_picker_state["years"] = years
+                rerun_year_select.options = years
+                rerun_year_select.value = years[0] if years else None
+                rerun_year_select.update()
+
+            rerun_ticker_select.on_value_change(_on_rerun_ticker_change)
 
             with ui.row().classes("gap-2 flex-wrap"):
 
@@ -6942,6 +7633,106 @@ def page_converter():
                 ui.button("Delete All Jobs", on_click=_delete_all).props(
                     "dense outline color=red"
                 )
+
+                def _queue_single_overwrite_rerun() -> None:
+                    from converter import queue_single_rerun_overwrite
+
+                    ticker = str(rerun_ticker_select.value or "").strip().upper()
+                    year_value = rerun_year_select.value
+                    if not ticker:
+                        ui.notify("Select a ticker", type="warning")
+                        return
+                    if year_value is None or str(year_value).strip() == "":
+                        ui.notify("Select a year", type="warning")
+                        return
+
+                    year = int(year_value)
+                    con = get_connection()
+                    try:
+                        init_db(con)
+                        result = queue_single_rerun_overwrite(
+                            con,
+                            ticker=ticker,
+                            year=year,
+                            rerun_reason=(
+                                "Manual rerun from converter page "
+                                f"({datetime.now().isoformat(timespec='seconds')})"
+                            ),
+                        )
+                    except Exception as exc:
+                        ui.notify(f"Failed to queue rerun: {exc}", type="negative")
+                        return
+                    finally:
+                        con.close()
+
+                    ui.notify(
+                        (
+                            f"Queued overwrite rerun for {result['ticker']}/{result['year']} "
+                            f"(removed {result['removed_outputs']} markdown file(s))"
+                        ),
+                        type="positive",
+                    )
+                    jobs_table.refresh()
+                    create_job_picker.refresh()
+                    _refresh_rerun_picker()
+
+                ui.button(
+                    "Queue Selected Rerun (Overwrite)",
+                    on_click=_queue_single_overwrite_rerun,
+                    color="secondary",
+                ).props("dense")
+
+                def _reimport_selected_markdown() -> None:
+                    from loader import sync_markdown_files
+
+                    ticker = str(rerun_ticker_select.value or "").strip().upper()
+                    year_value = rerun_year_select.value
+                    if not ticker:
+                        ui.notify("Select a ticker", type="warning")
+                        return
+                    if year_value is None or str(year_value).strip() == "":
+                        ui.notify("Select a year", type="warning")
+                        return
+
+                    year = int(year_value)
+                    con = get_connection()
+                    try:
+                        init_db(con)
+                        result = sync_markdown_files(
+                            con,
+                            source_dirs=[MARKDOWN_DIR],
+                            tickers=[ticker],
+                            years=[year],
+                        )
+                    except Exception as exc:
+                        ui.notify(
+                            f"Failed to re-import markdown: {exc}",
+                            type="negative",
+                        )
+                        return
+                    finally:
+                        con.close()
+
+                    ui.notify(
+                        (
+                            f"Re-imported markdown for {ticker}/{year}: "
+                            f"loaded={result.get('loaded', 0)}, failed={result.get('failed', 0)}"
+                        ),
+                        type="positive",
+                    )
+
+                ui.button(
+                    "Re-import Selected Markdown to DB",
+                    on_click=_reimport_selected_markdown,
+                    color="primary",
+                ).props("dense outline")
+
+                ui.button(
+                    "Refresh Rerun Options",
+                    on_click=_refresh_rerun_picker,
+                ).props("dense outline")
+
+            _refresh_rerun_picker()
 
             @ui.refreshable
             def converter_run_panel():

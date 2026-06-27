@@ -942,6 +942,128 @@ def get_job_summary(con: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return summary
 
 
+def _remove_markdown_outputs_for_year(
+    ticker: str,
+    year: int,
+    output_dirs: list[str | Path] | None = None,
+) -> int:
+    """Delete existing markdown files for a ticker/year so rerun can overwrite."""
+    targets = output_dirs or [MARKDOWN_DIR, OUTPUT_DIR]
+    removed = 0
+    year_text = str(year)
+    ticker_upper = ticker.upper()
+
+    for base in targets:
+        ticker_dir = Path(base) / ticker_upper
+        if not ticker_dir.exists():
+            continue
+        for md_path in ticker_dir.rglob("*.md"):
+            haystack = " ".join(
+                (
+                    md_path.name,
+                    md_path.stem,
+                    md_path.parent.name,
+                    md_path.as_posix(),
+                )
+            )
+            if year_text not in haystack:
+                continue
+            try:
+                md_path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                continue
+
+    return removed
+
+
+def queue_single_rerun_overwrite(
+    con: duckdb.DuckDBPyConnection,
+    ticker: str,
+    year: int,
+    rerun_reason: str | None = None,
+) -> dict[str, int | str]:
+    """Queue a pending conversion job for one ticker/year and overwrite old markdown output."""
+    ticker = str(ticker or "").strip().upper()
+    year = int(year)
+    if not ticker:
+        raise ValueError("Ticker is required")
+
+    source_row = con.execute(
+        "SELECT source_path FROM conversion_jobs WHERE ticker = ? AND year = ?",
+        [ticker, year],
+    ).fetchone()
+    source_path = str(source_row[0]) if source_row and source_row[0] else ""
+
+    if not source_path:
+        doc_row = con.execute(
+            """
+            SELECT raw_path
+            FROM vietstock_documents
+            WHERE ticker = ?
+              AND synced_to_raw = TRUE
+              AND raw_path IS NOT NULL
+              AND raw_path != ''
+              AND regexp_extract(title, '(\\d{4})', 1) = ?
+            ORDER BY published_date DESC
+            LIMIT 1
+            """,
+            [ticker, str(year)],
+        ).fetchone()
+        source_path = str(doc_row[0]) if doc_row and doc_row[0] else ""
+
+    if not source_path:
+        raise ValueError(
+            f"No raw source file found for {ticker}/{year}. Sync or download source PDF first."
+        )
+
+    removed_outputs = _remove_markdown_outputs_for_year(ticker, year)
+
+    reason = (
+        rerun_reason
+        or f"Manual overwrite rerun ({datetime.now().isoformat(timespec='seconds')})"
+    )
+
+    queued = con.execute(
+        """
+        INSERT INTO conversion_jobs (
+            id, ticker, year, start_year, end_year, source_path, output_dir, status
+        ) VALUES (
+            nextval('conversion_jobs_id_seq'), ?, ?, ?, ?, ?, ?, 'pending'
+        )
+        ON CONFLICT (ticker, year) DO UPDATE SET
+            source_path = EXCLUDED.source_path,
+            output_dir = EXCLUDED.output_dir,
+            status = 'pending',
+            rerun_reason = ?,
+            command = NULL,
+            log_path = NULL,
+            pid = NULL,
+            error_message = NULL,
+            failed_step = NULL,
+            started_at = NULL,
+            completed_at = NULL
+        RETURNING id
+        """,
+        [
+            ticker,
+            year,
+            year,
+            year,
+            source_path,
+            str(MARKDOWN_DIR),
+            reason,
+        ],
+    ).fetchone()
+
+    return {
+        "ticker": ticker,
+        "year": year,
+        "job_id": int(queued[0]) if queued and queued[0] is not None else -1,
+        "removed_outputs": removed_outputs,
+    }
+
+
 def queue_force_ocr_reruns(
     con: duckdb.DuckDBPyConnection,
     limit: int | None = None,
