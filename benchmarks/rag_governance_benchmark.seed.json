@@ -1,0 +1,103 @@
+{
+  "version": "0.1.0",
+  "description": "Phase 0 seed benchmark cases for governance retrieval and extraction quality checks.",
+  "cases": [
+    {
+      "id": "AAA_2025_GOV_SUPERVISORY_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SUPERVISORY",
+      "required_terms": ["ban kiem soat", "bks", "thanh vien bks"],
+      "forbidden_terms": ["ke toan truong", "tong giam doc", "hdqt"],
+      "source_section_hints": ["gioi thieu ban kiem soat", "hoat dong cua bks"],
+      "notes": "Primary leakage regression case for supervisory board retrieval."
+    },
+    {
+      "id": "AAA_2025_GOV_SUPERVISORY_ENTITIES",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SUPERVISORY",
+      "required_terms": ["ban kiem soat", "truong bks"],
+      "forbidden_terms": ["ke toan truong", "tong giam doc", "hdqt"],
+      "expected_entities": [
+        "Nguyen Thi Giang",
+        "Nguyen Thi Phuong",
+        "Van Thi Lan Anh"
+      ],
+      "expected_count": 3,
+      "enabled_for_extraction_eval": true,
+      "notes": "Entity-level supervisory benchmark for exact list comparison."
+    },
+    {
+      "id": "AAA_2025_GOV_DIRECTORY_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_DIRECTORY",
+      "required_terms": ["hoi dong quan tri", "hdqt", "thanh vien hdqt"],
+      "forbidden_terms": ["ban kiem soat", "thanh vien bks"],
+      "source_section_hints": ["gioi thieu hoi dong quan tri", "hoat dong cua hdqt"]
+    },
+    {
+      "id": "AAA_2025_GOV_DIRECTORY_ENTITIES",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_DIRECTORY",
+      "required_terms": ["hoi dong quan tri", "hdqt"],
+      "expected_entities": [
+        "Nguyen Le Thang Long",
+        "Phan Tri Nghia",
+        "Hoa Thi Thu Ha",
+        "Nguyen Thi Tien",
+        "Tran Thi Thoan"
+      ],
+      "expected_count": 5,
+      "enabled_for_extraction_eval": true
+    },
+    {
+      "id": "AAA_2025_GOV_EXECUTIVE_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_EXECUTIVE",
+      "required_terms": ["ban dieu hanh", "tong giam doc", "pho tong giam doc", "ke toan truong"],
+      "forbidden_terms": ["thanh vien bks", "truong bks"],
+      "source_section_hints": ["gioi thieu ban dieu hanh"]
+    },
+    {
+      "id": "AAA_2025_GOV_SHAREHOLDERS_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SHAREHOLDERS",
+      "required_terms": ["co dong", "co dong lon", "ty le so huu", "co phieu"],
+      "forbidden_terms": ["ban kiem soat", "hdqt"],
+      "source_section_hints": ["co cau co dong", "thong tin co phieu"]
+    },
+    {
+      "id": "AAA_2025_GOV_SHAREHOLDERS_ENTITY",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SHAREHOLDERS",
+      "required_terms": ["co dong lon", "ty le so huu"],
+      "expected_entities": ["CTCP Tap doan An Phat Holdings"],
+      "enabled_for_extraction_eval": true
+    },
+    {
+      "id": "AAA_2025_GOV_AUDIT_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_AUDIT",
+      "required_terms": ["kiem toan", "bao cao kiem toan", "uy ban kiem toan"],
+      "forbidden_terms": ["thanh vien bks", "tong giam doc"],
+      "source_section_hints": ["kiem toan", "bao cao kiem toan"]
+    },
+    {
+      "id": "AAA_2025_GOV_AUDIT_ENTITY",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_AUDIT",
+      "required_terms": ["kiem toan"],
+      "expected_entities": ["Cong ty TNHH EY Viet Nam"],
+      "enabled_for_extraction_eval": true,
+      "notes": "Audit firm naming may vary by extraction; monitor as soft signal."
+    }
+  ]
+}

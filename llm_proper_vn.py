@@ -24,6 +24,7 @@ from config import (
     EMBEDDING_MODEL,
     ENV_JSON_PATH,
     INFERENCE_MODEL,
+    INFERENCE_TEMPERATURE,
     INFERENCE_TOP_K,
     PROPER_VN_ALL_ITEMS,
     PROPER_VN_STAGE1_ITEMS,
@@ -31,6 +32,12 @@ from config import (
 )
 from database import ensure_vss_loaded, get_connection
 from embedder import _get_client, get_embeddings
+from llm_batch_api import (
+    get_batch_output_map,
+    get_batch_status,
+    run_chat_json_batch,
+    submit_chat_json_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -248,20 +255,17 @@ def evaluate_proper_indicator(
 
     _is_reasoning = model.startswith(("o1", "o3", "o4", "gpt-5"))
 
-    api_kwargs: dict = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
-    }
-    if _is_reasoning:
-        api_kwargs["reasoning_effort"] = "low"
-    else:
-        api_kwargs["temperature"] = 0
-
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(**api_kwargs)
+            response_map = run_chat_json_batch(
+                client=client,
+                model=model,
+                prompts={"eval": prompt},
+                is_reasoning=_is_reasoning,
+                temperature=INFERENCE_TEMPERATURE,
+            )
+            raw = response_map["eval"]
             break
         except Exception as exc:
             last_exc = exc
@@ -271,7 +275,6 @@ def evaluate_proper_indicator(
                 prompt = _PROPER_EVAL_PROMPT.format(
                     content=content, criteria=indicator_description
                 )
-                api_kwargs["messages"] = [{"role": "user", "content": prompt}]
                 logger.warning(
                     "Prompt too large for %s; shrinking and retrying (attempt %d/3)",
                     model,
@@ -282,7 +285,69 @@ def evaluate_proper_indicator(
     else:
         raise last_exc  # type: ignore[misc]
 
-    raw = response.choices[0].message.content or ""
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        result = {
+            "is_present": False,
+            "evidence_level": "none",
+            "reason": f"Failed to parse LLM response: {raw}",
+        }
+
+    return {
+        "is_present": bool(result.get("is_present", False)),
+        "evidence_level": str(result.get("evidence_level", "none")),
+        "reason": str(result.get("reason", "")),
+    }
+
+
+def _build_proper_prompt(chunks: list[dict], indicator_description: str) -> str:
+    def _estimate_tokens(text: str) -> int:
+        if tiktoken is not None:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        return max(1, len(text) // 4)
+
+    def _truncate_text_tokens(text: str, max_tokens: int) -> str:
+        if max_tokens <= 0:
+            return ""
+        if tiktoken is not None:
+            enc = tiktoken.get_encoding("cl100k_base")
+            toks = enc.encode(text)
+            if len(toks) <= max_tokens:
+                return text
+            return enc.decode(toks[:max_tokens])
+        words = text.split()
+        if len(words) <= max_tokens:
+            return text
+        return " ".join(words[:max_tokens])
+
+    selected_chunks: list[str] = []
+    used_tokens = 0
+    for chunk in chunks:
+        text = str(chunk.get("chunk_text") or "")
+        if not text:
+            continue
+        token_count = int(chunk.get("token_count") or _estimate_tokens(text))
+        if used_tokens + token_count <= MAX_PROMPT_CONTENT_TOKENS:
+            selected_chunks.append(text)
+            used_tokens += token_count
+            continue
+        remain = MAX_PROMPT_CONTENT_TOKENS - used_tokens
+        if remain > 0 and not selected_chunks:
+            selected_chunks.append(_truncate_text_tokens(text, remain))
+        break
+
+    if not selected_chunks:
+        selected_chunks = [""]
+
+    content = "\n".join(selected_chunks)
+    return _PROPER_EVAL_PROMPT.format(
+        content=content, criteria=indicator_description
+    )
+
+
+def _parse_proper_raw(raw: str) -> dict:
     try:
         result = json.loads(raw)
     except json.JSONDecodeError:
@@ -435,7 +500,10 @@ def create_proper_vn_jobs(
                 UPDATE proper_vn_jobs
                 SET status = 'pending', error_message = NULL,
                     started_at = NULL, completed_at = NULL,
-                    indicators_done = 0, color = NULL
+                    indicators_done = 0, color = NULL,
+                    batch_id = NULL,
+                    batch_submitted_at = NULL,
+                    batch_checked_at = NULL
                 WHERE ticker = ? AND year = ? AND model = ?
                 """,
                 [ticker, year, inference_model],
@@ -475,6 +543,9 @@ def get_proper_vn_jobs(
         "top_k",
         "indicators_done",
         "indicators_total",
+        "batch_id",
+        "batch_submitted_at",
+        "batch_checked_at",
         "color",
         "s2_score",
         "s2_max_score",
@@ -509,7 +580,8 @@ def reset_failed_proper_vn_jobs(
     query = (
         "UPDATE proper_vn_jobs SET status = 'pending', error_message = NULL, "
         "started_at = NULL, completed_at = NULL, indicators_done = 0, "
-        "color = NULL WHERE status = 'failed'"
+        "color = NULL, batch_id = NULL, batch_submitted_at = NULL, "
+        "batch_checked_at = NULL WHERE status = 'failed'"
     )
     params: list = []
     if model:
@@ -698,7 +770,7 @@ def infer_proper_vn_report(
 
     # ── Ensure a job row exists ──────────────────────────────────────────
     existing_job = con.execute(
-        "SELECT status FROM proper_vn_jobs "
+        "SELECT status, batch_id FROM proper_vn_jobs "
         "WHERE ticker = ? AND year = ? AND model = ?",
         [ticker, year, inference_model],
     ).fetchone()
@@ -726,6 +798,163 @@ def infer_proper_vn_report(
     )
 
     try:
+        batch_id = str(existing_job[1]) if existing_job and existing_job[1] else None
+        client = _get_client()
+
+        if batch_id:
+            batch_status = get_batch_status(client, batch_id)
+            con.execute(
+                """
+                UPDATE proper_vn_jobs
+                SET batch_checked_at = get_current_timestamp(),
+                    status = CASE
+                        WHEN ? = 'completed' THEN status
+                        WHEN ? IN ('failed', 'expired', 'cancelled') THEN 'failed'
+                        ELSE 'running'
+                    END
+                WHERE ticker = ? AND year = ? AND model = ?
+                """,
+                [batch_status, batch_status, ticker, year, inference_model],
+            )
+
+            if batch_status in {"validating", "in_progress", "finalizing", "cancelling"}:
+                return {
+                    "color": "BatchSubmitted",
+                    "stage": 0,
+                    "reason": f"Waiting for OpenAI batch {batch_id}",
+                    "s2_score": 0,
+                    "s2_max_score": len(PROPER_VN_STAGE2_ITEMS) * 2,
+                }
+
+            if batch_status in {"failed", "expired", "cancelled"}:
+                msg = f"Batch {batch_id} ended with status={batch_status}"
+                con.execute(
+                    """
+                    UPDATE proper_vn_jobs
+                    SET status = 'failed', completed_at = get_current_timestamp(),
+                        error_message = ?, batch_id = NULL
+                    WHERE ticker = ? AND year = ? AND model = ?
+                    """,
+                    [msg, ticker, year, inference_model],
+                )
+                raise RuntimeError(msg)
+
+            output_map = get_batch_output_map(client, batch_id)
+            by_code = {it["code"]: it for it in PROPER_VN_ALL_ITEMS}
+
+            for code, raw in output_map.items():
+                if code not in by_code:
+                    continue
+                chunks = retrieve_chunks_for_indicator(
+                    con,
+                    ticker,
+                    year,
+                    code,
+                    top_k=top_k,
+                    model=embedding_model,
+                    dimensions=dimensions,
+                )
+                result = _parse_proper_raw(raw)
+                similarities_json = json.dumps([round(c["distance"], 6) for c in chunks])
+                top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
+
+                con.execute(
+                    """
+                    INSERT INTO proper_vn_results
+                        (id, ticker, year, indicator_code, is_present,
+                         evidence_level, reason, top_chunks, similarities, model)
+                    VALUES
+                        (nextval('proper_vn_results_id_seq'),
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ticker, year, indicator_code, model) DO UPDATE SET
+                        is_present = EXCLUDED.is_present,
+                        evidence_level = EXCLUDED.evidence_level,
+                        reason = EXCLUDED.reason,
+                        top_chunks = EXCLUDED.top_chunks,
+                        similarities = EXCLUDED.similarities,
+                        created_at = get_current_timestamp()
+                    """,
+                    [
+                        ticker,
+                        year,
+                        code,
+                        result["is_present"],
+                        result["evidence_level"],
+                        result["reason"],
+                        top_chunks_json,
+                        similarities_json,
+                        inference_model,
+                    ],
+                )
+
+            rows = con.execute(
+                "SELECT indicator_code, is_present, evidence_level, reason "
+                "FROM proper_vn_results WHERE ticker = ? AND year = ? AND model = ?",
+                [ticker, year, inference_model],
+            ).fetchall()
+            all_indicator_results = {
+                str(r[0]): {
+                    "is_present": bool(r[1]),
+                    "evidence_level": str(r[2]),
+                    "reason": str(r[3]),
+                }
+                for r in rows
+            }
+            total_done = len(all_indicator_results)
+
+            if total_done >= total_indicators:
+                stage1_results = {
+                    c: all_indicator_results[c]
+                    for c in [i["code"] for i in PROPER_VN_STAGE1_ITEMS]
+                    if c in all_indicator_results
+                }
+                stage2_results = {
+                    c: all_indicator_results[c]
+                    for c in [i["code"] for i in PROPER_VN_STAGE2_ITEMS]
+                    if c in all_indicator_results
+                }
+                classification = classify_proper_color(stage1_results, stage2_results)
+                con.execute(
+                    """
+                    UPDATE proper_vn_jobs
+                    SET status = 'completed', completed_at = get_current_timestamp(),
+                        indicators_done = ?, color = ?,
+                        s2_score = ?, s2_max_score = ?,
+                        batch_id = NULL
+                    WHERE ticker = ? AND year = ? AND model = ?
+                    """,
+                    [
+                        total_done,
+                        classification["color"],
+                        classification["s2_score"],
+                        classification["s2_max_score"],
+                        ticker,
+                        year,
+                        inference_model,
+                    ],
+                )
+                if own_con:
+                    con.close()
+                return classification
+
+            con.execute(
+                """
+                UPDATE proper_vn_jobs
+                SET status = 'pending', indicators_done = ?, batch_id = NULL
+                WHERE ticker = ? AND year = ? AND model = ?
+                """,
+                [total_done, ticker, year, inference_model],
+            )
+            if own_con:
+                con.close()
+            return {
+                "color": "Pending",
+                "stage": 0,
+                "reason": "Partial PROPER-VN results loaded from batch output",
+                "s2_score": 0,
+                "s2_max_score": len(PROPER_VN_STAGE2_ITEMS) * 2,
+            }
+
         # Check embeddings exist
         row = con.execute(
             "SELECT COUNT(*) FROM document_embeddings "
@@ -748,6 +977,7 @@ def infer_proper_vn_report(
 
         done = 0
         all_indicator_results: dict[str, dict] = {}
+        prompts: dict[str, str] = {}
 
         for item in PROPER_VN_ALL_ITEMS:
             code = item["code"]
@@ -787,60 +1017,71 @@ def infer_proper_vn_report(
                     "evidence_level": "none",
                     "reason": "No relevant text chunks found in the report.",
                 }
-            else:
-                result = evaluate_proper_indicator(
-                    chunks,
-                    code,
-                    item["description"],
-                    model=inference_model,
+                all_indicator_results[code] = result
+                similarities_json = json.dumps([round(c["distance"], 6) for c in chunks])
+                top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
+                con.execute(
+                    """
+                    INSERT INTO proper_vn_results
+                        (id, ticker, year, indicator_code, is_present,
+                         evidence_level, reason, top_chunks, similarities, model)
+                    VALUES
+                        (nextval('proper_vn_results_id_seq'),
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ticker, year, indicator_code, model) DO UPDATE SET
+                        is_present = EXCLUDED.is_present,
+                        evidence_level = EXCLUDED.evidence_level,
+                        reason = EXCLUDED.reason,
+                        top_chunks = EXCLUDED.top_chunks,
+                        similarities = EXCLUDED.similarities,
+                        created_at = get_current_timestamp()
+                    """,
+                    [
+                        ticker,
+                        year,
+                        code,
+                        result["is_present"],
+                        result["evidence_level"],
+                        result["reason"],
+                        top_chunks_json,
+                        similarities_json,
+                        inference_model,
+                    ],
                 )
+                done += 1
+                continue
+            else:
+                prompts[code] = _build_proper_prompt(chunks, item["description"])
 
-            all_indicator_results[code] = result
-
-            # Store result
-            similarities_json = json.dumps(
-                [round(c["distance"], 6) for c in chunks]
+        if prompts:
+            is_reasoning = inference_model.startswith(("o1", "o3", "o4", "gpt-5"))
+            new_batch_id = submit_chat_json_batch(
+                client=client,
+                model=inference_model,
+                prompts=prompts,
+                is_reasoning=is_reasoning,
+                temperature=INFERENCE_TEMPERATURE,
             )
-            top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
-
-            con.execute(
-                """
-                INSERT INTO proper_vn_results
-                    (id, ticker, year, indicator_code, is_present,
-                     evidence_level, reason, top_chunks, similarities, model)
-                VALUES
-                    (nextval('proper_vn_results_id_seq'),
-                     ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (ticker, year, indicator_code, model) DO UPDATE SET
-                    is_present = EXCLUDED.is_present,
-                    evidence_level = EXCLUDED.evidence_level,
-                    reason = EXCLUDED.reason,
-                    top_chunks = EXCLUDED.top_chunks,
-                    similarities = EXCLUDED.similarities,
-                    created_at = get_current_timestamp()
-                """,
-                [
-                    ticker,
-                    year,
-                    code,
-                    result["is_present"],
-                    result["evidence_level"],
-                    result["reason"],
-                    top_chunks_json,
-                    similarities_json,
-                    inference_model,
-                ],
-            )
-
-            done += 1
             con.execute(
                 """
                 UPDATE proper_vn_jobs
-                SET indicators_done = ?
+                SET status = 'running', indicators_done = ?,
+                    batch_id = ?,
+                    batch_submitted_at = get_current_timestamp(),
+                    batch_checked_at = get_current_timestamp()
                 WHERE ticker = ? AND year = ? AND model = ?
                 """,
-                [done, ticker, year, inference_model],
+                [done, new_batch_id, ticker, year, inference_model],
             )
+            if own_con:
+                con.close()
+            return {
+                "color": "BatchSubmitted",
+                "stage": 0,
+                "reason": f"Submitted OpenAI batch {new_batch_id} ({len(prompts)} indicators)",
+                "s2_score": 0,
+                "s2_max_score": len(PROPER_VN_STAGE2_ITEMS) * 2,
+            }
 
         # ── Classify color ───────────────────────────────────────────────
         stage1_results = {

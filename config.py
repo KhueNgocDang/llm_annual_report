@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 from dotenv import load_dotenv
 
@@ -36,6 +37,21 @@ EMBEDDING_BATCH_SIZE: int = 512
 # Inference settings
 INFERENCE_MODEL: str = "gpt-4.1-mini"
 INFERENCE_TOP_K: int = 5
+INFERENCE_TEMPERATURE: float = float(os.getenv("INFERENCE_TEMPERATURE", "0"))
+
+# Phase 1 hybrid retrieval scoring weights for governance RAG.
+INFERENCE_RETRIEVAL_ALPHA: float = float(
+	os.getenv("INFERENCE_RETRIEVAL_ALPHA", "1.0")
+)
+INFERENCE_RETRIEVAL_BETA: float = float(
+	os.getenv("INFERENCE_RETRIEVAL_BETA", "0.12")
+)
+INFERENCE_RETRIEVAL_GAMMA: float = float(
+	os.getenv("INFERENCE_RETRIEVAL_GAMMA", "0.08")
+)
+INFERENCE_RETRIEVAL_CANDIDATE_MULTIPLIER: int = int(
+	os.getenv("INFERENCE_RETRIEVAL_CANDIDATE_MULTIPLIER", "4")
+)
 
 # Environmental Disclosure Checklist
 CHECKLIST_ITEMS: list[dict[str, str]] = [
@@ -215,33 +231,136 @@ GOVERNANCE_EXTRACTION_ITEMS: list[dict[str, str]] = [
 			"Trich xuat danh sach co dong duoc de cap trong bao cao. "
 			"Liet ke co dong lon (so huu tu 5% tro len) va co dong khac neu co. "
 			"Voi moi co dong: ten, so co phan so huu, ty le so huu (%), "
-			"loai co dong (ca nhan/to chuc/nha nuoc/nuoc ngoai), quoc tich. "
+			"loai co dong (ca nhan/to chuc/nha nuoc/nuoc ngoai). "
 			"Tong hop: tong so co phieu dang luu hanh, co phieu quy, "
 			"ty le so huu nuoc ngoai, ty le so huu nha nuoc, "
 			"so co phan do to chuc nam giu, so co phan do ca nhan nam giu."
 		),
+		"json_template": """{
+	"value": {
+		"total_outstanding_shares": null,
+		"total_treasury_shares": null,
+		"foreign_ownership_pct": null,
+		"state_ownership_pct": null,
+		"institutional_shares": null,
+		"individual_shares": null
+	},
+	"details": [
+		{
+			"name": null,
+			"shares": null,
+			"ownership_pct": null,
+			"type": null,
+			"notes": null
+		}
+	],
+	"reason": null
+}""",
 	},
 	{
-		"code": "GOV_BOARD",
+		"code": "GOV_DIRECTORY",
 		"group": "Board of Directors",
 		"item": "Board of directors full member list",
 		"description": (
 			"Trich xuat danh sach thanh vien Hoi dong quan tri (HDQT). "
-			"Voi moi nguoi: ho ten, chuc vu, gioi tinh, ngay sinh, quoc tich, "
+			"Voi moi nguoi: ho ten, chuc vu HDQT, gioi tinh, ngay sinh, "
 			"ngay bo nhiem, nhiem ky, trinh do hoc van, so co phan, ty le so huu, "
-			"thanh vien doc lap hay khong, thanh vien dieu hanh hay khong, "
-			"Chu tich HDQT co kiem CEO hay khong."
+			"thanh vien doc lap hay khong. "
+			"Neu la thanh vien doc lap thi ghi ro ly do/chung cu xac dinh doc lap. "
+			"Khong trich xuat Ban Dieu hanh trong item nay."
 		),
+		"json_template": """{
+	"value": {
+		"total_members": null,
+		"women_count": null,
+		"men_count": null,
+		"foreign_count": null,
+		"independent_count": null,
+		"chair_name": null
+	},
+	"details": [
+		{
+			"name": null,
+			"position": null,
+			"gender": null,
+			"date_of_birth": null,
+			"appointment_date": null,
+			"term_end": null,
+			"education": null,
+			"shares_owned": null,
+			"ownership_pct": null,
+			"is_independent": null,
+			"independent_reason": null,
+			"notes": null
+		}
+	],
+	"reason": null
+}""",
+	},
+	{
+		"code": "GOV_EXECUTIVE",
+		"group": "Executive Management",
+		"item": "Executive management member list",
+		"description": (
+			"Trich xuat danh sach Ban Dieu hanh va cac chuc danh dieu hanh "
+			"(Tong Giam doc/CEO, Pho Tong Giam doc, Ke toan truong, chuc danh dieu hanh khac). "
+			"Voi moi nguoi: ho ten, chuc vu dieu hanh, gioi tinh, ngay sinh, "
+			"ngay bo nhiem, trinh do hoc van, co dong thoi la thanh vien HDQT hay khong. "
+			"Neu la vai tro dieu hanh thi ghi ro ly do/chung cu tu chuc danh."
+		),
+		"json_template": """{
+	"value": {
+		"total_members": null,
+		"women_count": null,
+		"men_count": null,
+		"ceo_name": null,
+		"chief_accountant_name": null,
+		"board_member_count": null
+	},
+	"details": [
+		{
+			"name": null,
+			"position": null,
+			"gender": null,
+			"date_of_birth": null,
+			"appointment_date": null,
+			"education": null,
+			"is_executive": null,
+			"executive_reason": null,
+			"is_board_member": null,
+			"notes": null
+		}
+	],
+	"reason": null
+}""",
 	},
 	{
 		"code": "GOV_AUDIT",
 		"group": "Audit",
 		"item": "Audit firm and audit committee details",
 		"description": (
-			"Trich xuat thong tin kiem toan: cong ty kiem toan doc lap, "
-			"y kien kiem toan, phi kiem toan, uy ban kiem toan noi bo, "
-			"danh sach thanh vien va kiem toan vien ky bao cao."
+			"Trich xuat thong tin kiem toan doc lap cua cong ty: "
+			"ten cong ty kiem toan doc lap, y kien kiem toan, "
+			"kiem toan vien ky bao cao. "
+			"Khong trich xuat thanh vien Ban Kiem soat hoac thanh vien Uy ban Kiem toan noi bo."
 		),
+		"json_template": """{
+	"value": {
+		"external_audit_firm": null,
+		"external_audit_firm_en": null,
+		"audit_opinion": null,
+		"signing_auditor_names": []
+	},
+	"details": [
+		{
+			"name": null,
+			"role": null,
+			"organization": null,
+			"notes": null
+		}
+	],
+	"reason": null
+}""",
 	},
 	{
 		"code": "GOV_SUPERVISORY",
@@ -250,14 +369,28 @@ GOVERNANCE_EXTRACTION_ITEMS: list[dict[str, str]] = [
 		"description": (
 			"Trich xuat danh sach thanh vien Ban Kiem soat va thong tin tung thanh vien."
 		),
+		"json_template": """{
+	"value": {
+		"total_members": null,
+		"women_count": null,
+		"men_count": null,
+		"independent_count": null
 	},
-	{
-		"code": "GOV_COMPANY_INFO",
-		"group": "Company Information",
-		"item": "Company founding year and basic information",
-		"description": (
-			"Trich xuat nam thanh lap, ten day du, ma chung khoan, ngay niem yet, "
-			"linh vuc hoat dong chinh."
-		),
+	"details": [
+		{
+			"name": null,
+			"position": null,
+			"gender": null,
+			"is_independent": null,
+			"date_of_birth": null,
+			"appointment_date": null,
+			"term_end": null,
+			"education": null,
+			"shares_owned": null,
+			"notes": null
+		}
+	],
+	"reason": null
+}""",
 	},
 ]

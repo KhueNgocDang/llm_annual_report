@@ -1,0 +1,241 @@
+{
+  "summary": {
+    "timestamp_utc": "2026-06-25T13:34:33.805133+00:00",
+    "benchmark_file": "benchmarks/rag_governance_benchmark.seed.json",
+    "model": "gpt-4.1-mini",
+    "top_k": 5,
+    "run_extraction": true,
+    "cases_total": 10,
+    "retrieval_cases_evaluated": 10,
+    "retrieval_precision_at_k_avg": 0.45999999999999996,
+    "retrieval_forbidden_hit_rate_avg": 0.04,
+    "retrieval_any_relevant_rate": 0.6,
+    "extraction_cases_evaluated": 4,
+    "extraction_exact_entity_match_rate": 0.5
+  },
+  "cases": [
+    {
+      "id": "AAA_2025_GOV_SUPERVISORY_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SUPERVISORY",
+      "retrieval": {
+        "retrieval_precision_at_k": 1.0,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": true
+      },
+      "top_chunk_indices": [
+        140,
+        46,
+        45,
+        131,
+        142
+      ]
+    },
+    {
+      "id": "AAA_2025_GOV_SUPERVISORY_ENTITIES",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SUPERVISORY",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.8,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": true
+      },
+      "top_chunk_indices": [
+        140,
+        46,
+        45,
+        131,
+        142
+      ],
+      "extraction": {
+        "expected_count": 3,
+        "predicted_count": 3,
+        "extraction_exact_entity_match": true,
+        "missing_entities": [],
+        "unexpected_entities": []
+      }
+    },
+    {
+      "id": "AAA_2025_GOV_BOARD_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_BOARD",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.0,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": false
+      },
+      "top_chunk_indices": [
+        88,
+        125,
+        124,
+        129,
+        126
+      ]
+    },
+    {
+      "id": "AAA_2025_GOV_BOARD_ENTITIES",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_BOARD",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.0,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": false
+      },
+      "top_chunk_indices": [
+        88,
+        125,
+        124,
+        129,
+        126
+      ],
+      "extraction": {
+        "expected_count": 5,
+        "predicted_count": 5,
+        "extraction_exact_entity_match": true,
+        "missing_entities": [],
+        "unexpected_entities": []
+      }
+    },
+    {
+      "id": "AAA_2025_GOV_SHAREHOLDERS_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SHAREHOLDERS",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.6,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": true
+      },
+      "top_chunk_indices": [
+        99,
+        104,
+        105,
+        77,
+        64
+      ]
+    },
+    {
+      "id": "AAA_2025_GOV_SHAREHOLDERS_ENTITY",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_SHAREHOLDERS",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.0,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": false
+      },
+      "top_chunk_indices": [
+        99,
+        104,
+        105,
+        77,
+        64
+      ],
+      "extraction": {
+        "expected_count": null,
+        "predicted_count": 10,
+        "extraction_exact_entity_match": false,
+        "missing_entities": [
+          "ctcp tap doan an phat holdings"
+        ],
+        "unexpected_entities": [
+          "ctcp tap đoan an phat holdings",
+          "hoa thi thu ha",
+          "nguyen le thang long",
+          "nguyen le trung",
+          "nguyen thi giang",
+          "nguyen thi tien",
+          "nguyen xuan co",
+          "phan tri nghia",
+          "tran thi thoan",
+          "van thi lan anh"
+        ]
+      }
+    },
+    {
+      "id": "AAA_2025_GOV_AUDIT_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_AUDIT",
+      "retrieval": {
+        "retrieval_precision_at_k": 1.0,
+        "retrieval_forbidden_hit_rate": 0.4,
+        "retrieval_any_relevant": true
+      },
+      "top_chunk_indices": [
+        140,
+        136,
+        143,
+        141,
+        131
+      ]
+    },
+    {
+      "id": "AAA_2025_GOV_AUDIT_ENTITY",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_AUDIT",
+      "retrieval": {
+        "retrieval_precision_at_k": 1.0,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": true
+      },
+      "top_chunk_indices": [
+        140,
+        136,
+        143,
+        141,
+        131
+      ],
+      "extraction": {
+        "expected_count": null,
+        "predicted_count": 0,
+        "extraction_exact_entity_match": false,
+        "missing_entities": [
+          "cong ty tnhh ey viet nam"
+        ],
+        "unexpected_entities": []
+      }
+    },
+    {
+      "id": "AAA_2025_GOV_COMPANY_INFO_TERMS",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_COMPANY_INFO",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.2,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": true
+      },
+      "top_chunk_indices": [
+        212,
+        211,
+        213,
+        169,
+        196
+      ]
+    },
+    {
+      "id": "AAA_2025_GOV_COMPANY_INFO_TICKER",
+      "ticker": "AAA",
+      "year": 2025,
+      "item_code": "GOV_COMPANY_INFO",
+      "retrieval": {
+        "retrieval_precision_at_k": 0.0,
+        "retrieval_forbidden_hit_rate": 0.0,
+        "retrieval_any_relevant": false
+      },
+      "top_chunk_indices": [
+        212,
+        211,
+        213,
+        169,
+        196
+      ]
+    }
+  ]
+}

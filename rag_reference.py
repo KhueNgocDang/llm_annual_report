@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from config import BASE_DIR
+from config import BASE_DIR, INFERENCE_TEMPERATURE
 from database import get_connection, init_db
 
 try:
@@ -514,7 +514,7 @@ def generate_structured_requirement(
     if _is_reasoning_model(llm_model):
         request_kwargs["reasoning_effort"] = "low"
     else:
-        request_kwargs["temperature"] = 0
+        request_kwargs["temperature"] = INFERENCE_TEMPERATURE
 
     response = client.chat.completions.create(**request_kwargs)
     content = (response.choices[0].message.content or "").strip()

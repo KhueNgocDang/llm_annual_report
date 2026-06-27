@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import duckdb
 
 from config import DB_PATH
@@ -158,6 +161,9 @@ CREATE TABLE IF NOT EXISTS inference_jobs (
     top_k            INTEGER,
     categories_done  INTEGER DEFAULT 0,
     categories_total INTEGER DEFAULT 0,
+    batch_id          VARCHAR,
+    batch_submitted_at TIMESTAMP,
+    batch_checked_at   TIMESTAMP,
     started_at       TIMESTAMP,
     completed_at     TIMESTAMP,
     error_message    VARCHAR,
@@ -191,6 +197,9 @@ CREATE TABLE IF NOT EXISTS proper_vn_jobs (
     top_k            INTEGER,
     indicators_done  INTEGER DEFAULT 0,
     indicators_total INTEGER DEFAULT 0,
+    batch_id          VARCHAR,
+    batch_submitted_at TIMESTAMP,
+    batch_checked_at   TIMESTAMP,
     color            VARCHAR,
     s2_score         INTEGER,
     s2_max_score     INTEGER,
@@ -228,6 +237,9 @@ CREATE TABLE IF NOT EXISTS governance_jobs (
     top_k         INTEGER,
     items_done    INTEGER DEFAULT 0,
     items_total   INTEGER DEFAULT 0,
+    batch_id          VARCHAR,
+    batch_submitted_at TIMESTAMP,
+    batch_checked_at   TIMESTAMP,
     started_at    TIMESTAMP,
     completed_at  TIMESTAMP,
     error_message VARCHAR,
@@ -330,18 +342,30 @@ _MIGRATION_SQL = [
     "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS top_k INTEGER",
     "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS categories_done INTEGER",
     "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS categories_total INTEGER",
+    "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS batch_id VARCHAR",
+    "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS batch_submitted_at TIMESTAMP",
+    "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS batch_checked_at TIMESTAMP",
     "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS top_k INTEGER",
     "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS indicators_done INTEGER",
     "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS indicators_total INTEGER",
+    "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS batch_id VARCHAR",
+    "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS batch_submitted_at TIMESTAMP",
+    "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS batch_checked_at TIMESTAMP",
     "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS color VARCHAR",
     "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS s2_score INTEGER",
     "ALTER TABLE proper_vn_jobs ADD COLUMN IF NOT EXISTS s2_max_score INTEGER",
     "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS top_k INTEGER",
     "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS items_done INTEGER",
     "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS items_total INTEGER",
+    "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS batch_id VARCHAR",
+    "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS batch_submitted_at TIMESTAMP",
+    "ALTER TABLE governance_jobs ADD COLUMN IF NOT EXISTS batch_checked_at TIMESTAMP",
     "ALTER TABLE llm_model_presets ADD COLUMN IF NOT EXISTS is_active BOOLEAN",
     "UPDATE llm_model_presets SET is_active = TRUE WHERE is_active IS NULL",
 ]
+
+_INIT_DB_LOCK = threading.Lock()
+_INIT_DB_DONE = False
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
@@ -351,17 +375,42 @@ def get_connection() -> duckdb.DuckDBPyConnection:
 
 def init_db(con: duckdb.DuckDBPyConnection | None = None) -> None:
     """Create all tables if they don't exist."""
+    global _INIT_DB_DONE
+
     own = con is None
     if own:
         con = get_connection()
-    for stmt in _SCHEMA_SQL.strip().split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            con.execute(stmt)
-    for stmt in _MIGRATION_SQL:
-        con.execute(stmt)
-    if own:
-        con.close()
+
+    try:
+        with _INIT_DB_LOCK:
+            if _INIT_DB_DONE:
+                return
+
+            for stmt in _SCHEMA_SQL.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    con.execute(stmt)
+
+            retries = 5
+            for attempt in range(retries):
+                try:
+                    for stmt in _MIGRATION_SQL:
+                        con.execute(stmt)
+                    break
+                except duckdb.TransactionException as exc:
+                    # Another concurrent writer may still be applying ALTER statements.
+                    if (
+                        "catalog write-write conflict on alter" in str(exc).lower()
+                        and attempt < retries - 1
+                    ):
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+                    raise
+
+            _INIT_DB_DONE = True
+    finally:
+        if own:
+            con.close()
 
 
 def ensure_vss_loaded(con: duckdb.DuckDBPyConnection) -> None:

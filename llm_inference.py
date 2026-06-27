@@ -25,10 +25,17 @@ from config import (
     EMBEDDING_MODEL,
     ENV_JSON_PATH,
     INFERENCE_MODEL,
+    INFERENCE_TEMPERATURE,
     INFERENCE_TOP_K,
 )
 from database import ensure_vss_loaded, get_connection
 from embedder import _get_client, get_embeddings
+from llm_batch_api import (
+    get_batch_output_map,
+    get_batch_status,
+    run_chat_json_batch,
+    submit_chat_json_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -253,24 +260,20 @@ def evaluate_category(
     )
 
     # Reasoning models (gpt-5*, o-series) don't support temperature;
-    # use reasoning_effort instead.  Non-reasoning models (gpt-4.1*, gpt-4o*)
-    # support temperature=0.
+    # use reasoning_effort instead. Non-reasoning models use configured temperature.
     _is_reasoning = model.startswith(("o1", "o3", "o4", "gpt-5"))
-
-    api_kwargs: dict = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"},
-    }
-    if _is_reasoning:
-        api_kwargs["reasoning_effort"] = "low"
-    else:
-        api_kwargs["temperature"] = 0
 
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(**api_kwargs)
+            response_map = run_chat_json_batch(
+                client=client,
+                model=model,
+                prompts={"eval": prompt},
+                is_reasoning=_is_reasoning,
+                temperature=INFERENCE_TEMPERATURE,
+            )
+            raw = response_map["eval"]
             break
         except Exception as exc:
             last_exc = exc
@@ -280,7 +283,6 @@ def evaluate_category(
                 prompt = _EVAL_PROMPT.format(
                     content=content, criteria=category_description
                 )
-                api_kwargs["messages"] = [{"role": "user", "content": prompt}]
                 logger.warning(
                     "Prompt too large for %s; shrinking and retrying (attempt %d/3)",
                     model,
@@ -302,7 +304,6 @@ def evaluate_category(
     else:
         raise last_exc  # type: ignore[misc]
 
-    raw = response.choices[0].message.content or ""
     try:
         result = json.loads(raw)
     except json.JSONDecodeError:
@@ -311,6 +312,64 @@ def evaluate_category(
             "reason": f"Failed to parse LLM response: {raw}",
         }
 
+    return {
+        "is_valid": bool(result.get("is_valid", False)),
+        "reason": str(result.get("reason", "")),
+    }
+
+
+def _build_eval_prompt(chunks: list[dict], category_description: str) -> str:
+    def _estimate_tokens(text: str) -> int:
+        if tiktoken is not None:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return len(enc.encode(text))
+        return max(1, len(text) // 4)
+
+    def _truncate_text_tokens(text: str, max_tokens: int) -> str:
+        if max_tokens <= 0:
+            return ""
+        if tiktoken is not None:
+            enc = tiktoken.get_encoding("cl100k_base")
+            toks = enc.encode(text)
+            if len(toks) <= max_tokens:
+                return text
+            return enc.decode(toks[:max_tokens])
+        words = text.split()
+        if len(words) <= max_tokens:
+            return text
+        return " ".join(words[:max_tokens])
+
+    selected_chunks: list[str] = []
+    used_tokens = 0
+    for chunk in chunks:
+        text = str(chunk.get("chunk_text") or "")
+        if not text:
+            continue
+        token_count = int(chunk.get("token_count") or _estimate_tokens(text))
+        if used_tokens + token_count <= MAX_PROMPT_CONTENT_TOKENS:
+            selected_chunks.append(text)
+            used_tokens += token_count
+            continue
+        remain = MAX_PROMPT_CONTENT_TOKENS - used_tokens
+        if remain > 0 and not selected_chunks:
+            selected_chunks.append(_truncate_text_tokens(text, remain))
+        break
+
+    if not selected_chunks:
+        selected_chunks = [""]
+
+    content = "\n".join(selected_chunks)
+    return _EVAL_PROMPT.format(content=content, criteria=category_description)
+
+
+def _parse_eval_raw(raw: str) -> dict:
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        result = {
+            "is_valid": False,
+            "reason": f"Failed to parse LLM response: {raw}",
+        }
     return {
         "is_valid": bool(result.get("is_valid", False)),
         "reason": str(result.get("reason", "")),
@@ -376,7 +435,10 @@ def create_inference_jobs(
                 UPDATE inference_jobs
                 SET status = 'pending', error_message = NULL,
                     started_at = NULL, completed_at = NULL,
-                    categories_done = 0
+                    categories_done = 0,
+                    batch_id = NULL,
+                    batch_submitted_at = NULL,
+                    batch_checked_at = NULL
                 WHERE ticker = ? AND year = ? AND model = ?
                 """,
                 [ticker, year, inference_model],
@@ -416,6 +478,9 @@ def get_inference_jobs(
         "top_k",
         "categories_done",
         "categories_total",
+        "batch_id",
+        "batch_submitted_at",
+        "batch_checked_at",
         "started_at",
         "completed_at",
         "error_message",
@@ -448,7 +513,8 @@ def reset_failed_inference_jobs(
     """Reset failed inference jobs back to pending, optionally for a model."""
     query = (
         "UPDATE inference_jobs SET status = 'pending', error_message = NULL, "
-        "started_at = NULL, completed_at = NULL, categories_done = 0 "
+        "started_at = NULL, completed_at = NULL, categories_done = 0, "
+        "batch_id = NULL, batch_submitted_at = NULL, batch_checked_at = NULL "
         "WHERE status = 'failed'"
     )
     params: list = []
@@ -675,7 +741,7 @@ def infer_report(
 
     # ── Ensure an inference_jobs row exists ───────────────────────────────
     existing_job = con.execute(
-        "SELECT status FROM inference_jobs "
+        "SELECT status, batch_id FROM inference_jobs "
         "WHERE ticker = ? AND year = ? AND model = ?",
         [ticker, year, inference_model],
     ).fetchone()
@@ -705,6 +771,122 @@ def infer_report(
     )
 
     try:
+        batch_id = str(existing_job[1]) if existing_job and existing_job[1] else None
+        client = _get_client()
+
+        if batch_id:
+            batch_status = get_batch_status(client, batch_id)
+            con.execute(
+                """
+                UPDATE inference_jobs
+                SET batch_checked_at = get_current_timestamp(),
+                    status = CASE
+                        WHEN ? = 'completed' THEN status
+                        WHEN ? IN ('failed', 'expired', 'cancelled') THEN 'failed'
+                        ELSE 'running'
+                    END
+                WHERE ticker = ? AND year = ? AND model = ?
+                """,
+                [batch_status, batch_status, ticker, year, inference_model],
+            )
+
+            if batch_status in {"validating", "in_progress", "finalizing", "cancelling"}:
+                return 0
+
+            if batch_status in {"failed", "expired", "cancelled"}:
+                msg = f"Batch {batch_id} ended with status={batch_status}"
+                con.execute(
+                    """
+                    UPDATE inference_jobs
+                    SET status = 'failed', completed_at = get_current_timestamp(),
+                        error_message = ?, batch_id = NULL
+                    WHERE ticker = ? AND year = ? AND model = ?
+                    """,
+                    [msg, ticker, year, inference_model],
+                )
+                raise RuntimeError(msg)
+
+            output_map = get_batch_output_map(client, batch_id)
+            done_now = 0
+            by_code = {it["code"]: it for it in CHECKLIST_ITEMS}
+
+            for code, raw in output_map.items():
+                item = by_code.get(code)
+                if item is None:
+                    continue
+
+                chunks = retrieve_chunks_for_category(
+                    con,
+                    ticker,
+                    year,
+                    code,
+                    top_k=top_k,
+                    model=embedding_model,
+                    dimensions=dimensions,
+                )
+                result = _parse_eval_raw(raw)
+
+                similarities_json = json.dumps([round(c["distance"], 6) for c in chunks])
+                top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
+
+                con.execute(
+                    """
+                    INSERT INTO inference_results
+                        (id, ticker, year, category_code, is_valid, reason,
+                         top_chunks, similarities, model)
+                    VALUES
+                        (nextval('inference_results_id_seq'),
+                         ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ticker, year, category_code, model) DO UPDATE SET
+                        is_valid = EXCLUDED.is_valid,
+                        reason = EXCLUDED.reason,
+                        top_chunks = EXCLUDED.top_chunks,
+                        similarities = EXCLUDED.similarities,
+                        created_at = get_current_timestamp()
+                    """,
+                    [
+                        ticker,
+                        year,
+                        code,
+                        result["is_valid"],
+                        result["reason"],
+                        top_chunks_json,
+                        similarities_json,
+                        inference_model,
+                    ],
+                )
+                done_now += 1
+
+            total_results = con.execute(
+                "SELECT COUNT(*) FROM inference_results "
+                "WHERE ticker = ? AND year = ? AND model = ?",
+                [ticker, year, inference_model],
+            ).fetchone()
+            total_done = total_results[0] if total_results else 0
+
+            if total_done >= total_cats:
+                con.execute(
+                    """
+                    UPDATE inference_jobs
+                    SET status = 'completed', completed_at = get_current_timestamp(),
+                        categories_done = ?, batch_id = NULL
+                    WHERE ticker = ? AND year = ? AND model = ?
+                    """,
+                    [total_done, ticker, year, inference_model],
+                )
+            else:
+                con.execute(
+                    """
+                    UPDATE inference_jobs
+                    SET status = 'pending', categories_done = ?,
+                        batch_id = NULL
+                    WHERE ticker = ? AND year = ? AND model = ?
+                    """,
+                    [total_done, ticker, year, inference_model],
+                )
+
+            return done_now
+
         # Check that embeddings exist for this report
         row = con.execute(
             "SELECT COUNT(*) FROM document_embeddings WHERE ticker = ? AND year = ?",
@@ -727,6 +909,7 @@ def infer_report(
             )
 
         done = 0
+        prompts: dict[str, str] = {}
         for item in items_to_eval:
             code = item["code"]
 
@@ -759,59 +942,71 @@ def infer_report(
                     "is_valid": False,
                     "reason": "No relevant text chunks found in the report.",
                 }
-            else:
-                # 2. LLM evaluation
-                result = evaluate_category(
-                    chunks,
-                    code,
-                    item["description"],
-                    model=inference_model,
+                similarities_json = json.dumps([round(c["distance"], 6) for c in chunks])
+                top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
+                con.execute(
+                    """
+                    INSERT INTO inference_results
+                        (id, ticker, year, category_code, is_valid, reason,
+                         top_chunks, similarities, model)
+                    VALUES
+                        (nextval('inference_results_id_seq'),
+                         ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ticker, year, category_code, model) DO UPDATE SET
+                        is_valid = EXCLUDED.is_valid,
+                        reason = EXCLUDED.reason,
+                        top_chunks = EXCLUDED.top_chunks,
+                        similarities = EXCLUDED.similarities,
+                        created_at = get_current_timestamp()
+                    """,
+                    [
+                        ticker,
+                        year,
+                        code,
+                        result["is_valid"],
+                        result["reason"],
+                        top_chunks_json,
+                        similarities_json,
+                        inference_model,
+                    ],
                 )
+                done += 1
+                continue
 
-            # 3. Store result
-            similarities_json = json.dumps(
-                [round(c["distance"], 6) for c in chunks]
+            prompts[code] = _build_eval_prompt(chunks, item["description"])
+
+        # Submit all LLM requests for this report in one async batch.
+        if prompts:
+            is_reasoning = inference_model.startswith(("o1", "o3", "o4", "gpt-5"))
+            new_batch_id = submit_chat_json_batch(
+                client=client,
+                model=inference_model,
+                prompts=prompts,
+                is_reasoning=is_reasoning,
+                temperature=INFERENCE_TEMPERATURE,
             )
-            top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
-
-            con.execute(
-                """
-                INSERT INTO inference_results
-                    (id, ticker, year, category_code, is_valid, reason,
-                     top_chunks, similarities, model)
-                VALUES
-                    (nextval('inference_results_id_seq'),
-                     ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (ticker, year, category_code, model) DO UPDATE SET
-                    is_valid = EXCLUDED.is_valid,
-                    reason = EXCLUDED.reason,
-                    top_chunks = EXCLUDED.top_chunks,
-                    similarities = EXCLUDED.similarities,
-                    created_at = get_current_timestamp()
-                """,
-                [
-                    ticker,
-                    year,
-                    code,
-                    result["is_valid"],
-                    result["reason"],
-                    top_chunks_json,
-                    similarities_json,
-                    inference_model,
-                ],
-            )
-
-            done += 1
-
-            # Update progress
             con.execute(
                 """
                 UPDATE inference_jobs
-                SET categories_done = ?
+                SET status = 'running',
+                    categories_done = ?,
+                    batch_id = ?,
+                    batch_submitted_at = get_current_timestamp(),
+                    batch_checked_at = get_current_timestamp()
                 WHERE ticker = ? AND year = ? AND model = ?
                 """,
-                [done, ticker, year, inference_model],
+                [done, new_batch_id, ticker, year, inference_model],
             )
+            logger.info(
+                "Submitted inference batch %s for %s/%d (%d categories)",
+                new_batch_id,
+                ticker,
+                year,
+                len(prompts),
+            )
+            if own_con:
+                con.close()
+            return done + len(prompts)
 
         # Mark job completed (or update progress if partial run)
         total_results = con.execute(
@@ -826,7 +1021,8 @@ def infer_report(
                 """
                 UPDATE inference_jobs
                 SET status = 'completed', completed_at = get_current_timestamp(),
-                    categories_done = ?
+                    categories_done = ?,
+                    batch_id = NULL
                 WHERE ticker = ? AND year = ? AND model = ?
                 """,
                 [total_done, ticker, year, inference_model],
@@ -838,7 +1034,8 @@ def infer_report(
                 UPDATE inference_jobs
                 SET categories_done = ?,
                     status = CASE WHEN status = 'running' THEN 'pending'
-                                  ELSE status END
+                                  ELSE status END,
+                    batch_id = NULL
                 WHERE ticker = ? AND year = ? AND model = ?
                 """,
                 [total_done, ticker, year, inference_model],
