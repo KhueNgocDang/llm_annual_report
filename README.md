@@ -17,6 +17,20 @@ uv run python main.py
 - `11. Infer PROPER-VN`
 - `12. Extract Governance`
 
+## Hallucination Control
+
+Control model randomness with environment variable `INFERENCE_TEMPERATURE`.
+
+- Lower values are more deterministic (recommended for extraction/classification).
+- Typical range: `0.0` to `1.0`.
+- Default is `0` if not set.
+
+Example in `.env`:
+
+```env
+INFERENCE_TEMPERATURE=0
+```
+
 ## Smoke Commands
 
 Use the smoke CLI for quick validation without the UI:
@@ -33,6 +47,12 @@ uv run python smoke_llm.py create-jobs
 
 # Run one ticker-year end-to-end inference (EDC + PROPER-VN + governance)
 uv run python smoke_llm.py infer-one --ticker VNM --year 2024
+
+# Rescan markdown directory and update annual_reports in DB
+uv run python smoke_llm.py rescan-markdown
+
+# Preview only (no DB changes), optionally limited to a ticker/year
+uv run python smoke_llm.py rescan-markdown --preview-only --tickers ASG --years 2025
 ```
 
 ## Database Schema

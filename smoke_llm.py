@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from config import ensure_env_loaded
+from config import MARKDOWN_DIR, OUTPUT_DIR, ensure_env_loaded
 from database import get_connection, init_db
 from llm_embeddings import embed_all_reports, embed_report
 from llm_governance import create_governance_jobs, extract_governance
@@ -108,6 +108,52 @@ def cmd_infer_one(args: argparse.Namespace) -> None:
         con.close()
 
 
+def cmd_rescan_markdown(args: argparse.Namespace) -> None:
+    from loader import preview_markdown_sync, sync_markdown_files
+
+    source_dirs = [MARKDOWN_DIR]
+    if args.include_output:
+        source_dirs = [OUTPUT_DIR, MARKDOWN_DIR]
+
+    con = get_connection()
+    try:
+        init_db(con)
+        preview = preview_markdown_sync(
+            con,
+            source_dirs=source_dirs,
+            tickers=args.tickers,
+            years=args.years,
+        )
+        if args.preview_only:
+            print(json.dumps(preview, indent=2, ensure_ascii=False))
+            return
+
+        result = sync_markdown_files(
+            con,
+            source_dirs=source_dirs,
+            tickers=args.tickers,
+            years=args.years,
+        )
+        print(
+            json.dumps(
+                {
+                    "source_dirs": [str(path) for path in source_dirs],
+                    "scanned": preview["scanned"],
+                    "candidates": len(preview["candidates"]),
+                    "companies_to_add": preview["companies_to_add"],
+                    "years_to_add": preview["years_to_add"],
+                    "loaded": result["loaded"],
+                    "failed": result["failed"],
+                    "created_companies": result["created_companies"],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    finally:
+        con.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Smoke commands for LLM flows")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -139,6 +185,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_infer.add_argument("--model", default="gpt-4.1-mini")
     p_infer.add_argument("--replace", action="store_true")
     p_infer.set_defaults(func=cmd_infer_one)
+
+    p_rescan = sub.add_parser(
+        "rescan-markdown",
+        help="Rescan markdown files on disk and upsert annual_reports",
+    )
+    p_rescan.add_argument("--tickers", nargs="*")
+    p_rescan.add_argument("--years", nargs="*", type=int)
+    p_rescan.add_argument(
+        "--include-output",
+        action="store_true",
+        help="Also scan data/output in addition to data/markdown",
+    )
+    p_rescan.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Print preview only without updating database",
+    )
+    p_rescan.set_defaults(func=cmd_rescan_markdown)
 
     return parser
 

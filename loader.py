@@ -16,6 +16,12 @@ from markdown_quality import score_markdown_quality
 logger = logging.getLogger(__name__)
 
 _YEAR_RE = re.compile(r"(20\d{2})")
+_BR_TAG_RE = re.compile(r"(?i)<br\s*/?>")
+
+
+def _normalize_markdown_content(content: str) -> str:
+    """Normalize inline HTML artifacts before storing markdown in DuckDB."""
+    return _BR_TAG_RE.sub(" ", content)
 
 
 def _annual_report_quality_params(
@@ -80,10 +86,14 @@ def _resolve_markdown_source_file(source_file: str | Path) -> Path | None:
 
 def collect_markdown_files(
     source_dirs: list[str | Path] | None = None,
+    tickers: list[str] | None = None,
+    years: list[int] | None = None,
 ) -> list[dict[str, str | int]]:
     """Collect unique markdown documents from output/ and markdown/."""
     entries: list[dict[str, str | int]] = []
     seen_keys: set[tuple[str, int]] = set()
+    ticker_filter = {ticker.upper() for ticker in (tickers or [])}
+    year_filter = set(years or [])
 
     for base_dir in _markdown_source_dirs(source_dirs):
         if not base_dir.exists():
@@ -95,12 +105,17 @@ def collect_markdown_files(
                 continue
 
             ticker = rel_path.parts[0].upper()
+            if ticker_filter and ticker not in ticker_filter:
+                continue
+
             year = (
                 _extract_year(md_path.stem)
                 or _extract_year(md_path.parent.name)
                 or _extract_year(str(rel_path))
             )
             if year is None:
+                continue
+            if year_filter and year not in year_filter:
                 continue
 
             key = (ticker, year)
@@ -124,9 +139,15 @@ def collect_markdown_files(
 def preview_markdown_sync(
     con: duckdb.DuckDBPyConnection,
     source_dirs: list[str | Path] | None = None,
+    tickers: list[str] | None = None,
+    years: list[int] | None = None,
 ) -> dict:
     """Preview company/year additions implied by markdown files on disk."""
-    entries = collect_markdown_files(source_dirs=source_dirs)
+    entries = collect_markdown_files(
+        source_dirs=source_dirs,
+        tickers=tickers,
+        years=years,
+    )
     existing_companies = {
         row[0]
         for row in con.execute("SELECT ticker FROM companies").fetchall()
@@ -242,6 +263,7 @@ def audit_annual_report_quality(
             source_path = _resolve_markdown_source_file(source_file)
             if source_path is not None:
                 current_content = source_path.read_text(encoding="utf-8")
+        current_content = _normalize_markdown_content(str(current_content or ""))
 
         quality = score_markdown_quality(
             current_content,
@@ -417,6 +439,8 @@ def get_force_ocr_candidates(
 def sync_markdown_files(
     con: duckdb.DuckDBPyConnection,
     source_dirs: list[str | Path] | None = None,
+    tickers: list[str] | None = None,
+    years: list[int] | None = None,
     on_progress: Optional[
         Callable[[str, int | None, int, str, Optional[Exception]], None]
     ] = None,
@@ -425,7 +449,12 @@ def sync_markdown_files(
     from database import ensure_company
 
     counts = {"loaded": 0, "failed": 0, "created_companies": 0}
-    preview = preview_markdown_sync(con, source_dirs=source_dirs)
+    preview = preview_markdown_sync(
+        con,
+        source_dirs=source_dirs,
+        tickers=tickers,
+        years=years,
+    )
 
     for ticker in preview["companies_to_add"]:
         ensure_company(con, ticker)
@@ -437,7 +466,9 @@ def sync_markdown_files(
         path = Path(str(entry["path"]))
         source_file = str(entry["source_file"])
         try:
-            content = path.read_text(encoding="utf-8")
+            content = _normalize_markdown_content(
+                path.read_text(encoding="utf-8")
+            )
             quality = _annual_report_quality_params(content)
             con.execute(
                 """
