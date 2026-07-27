@@ -28,10 +28,10 @@ import time
 
 import duckdb
 
+from annual_inference_config import get_task_items, normalize_item_codes
 from config import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
-    GOVERNANCE_EXTRACTION_ITEMS,
     INFERENCE_MODEL,
     INFERENCE_RETRIEVAL_ALPHA,
     INFERENCE_RETRIEVAL_BETA,
@@ -42,6 +42,7 @@ from config import (
 )
 from database import ensure_vss_loaded, get_connection
 from embedder import _get_client, get_embeddings
+from hyde_retrieval import build_hyde2_embedding, precompute_hyde2_embeddings
 from llm_batch_api import (
     get_batch_output_map,
     get_batch_status,
@@ -58,6 +59,9 @@ except Exception:  # pragma: no cover
 
 
 MAX_PROMPT_CONTENT_TOKENS = 120000
+GOV_RESULTS_TABLE = "governance_results"
+GOV_RESULTS_WRITE_TABLE = "governance_results_hyde2"
+GOVERNANCE_ITEMS = get_task_items("governance")
 
 
 def _clean_chunk_text_for_prompt(text: str) -> str:
@@ -82,13 +86,14 @@ def _is_token_limit_error(exc: Exception) -> bool:
 
 def get_governance_items() -> list[dict[str, str]]:
     """Return all governance extraction items."""
-    return GOVERNANCE_EXTRACTION_ITEMS
+    return get_task_items("governance")
 
 
 def get_governance_groups() -> dict[str, list[dict]]:
     """Return governance items grouped by their group name."""
+    governance_items = get_task_items("governance")
     groups: dict[str, list[dict]] = {}
-    for item in GOVERNANCE_EXTRACTION_ITEMS:
+    for item in governance_items:
         groups.setdefault(item["group"], []).append(item)
     return groups
 
@@ -103,24 +108,35 @@ _gov_category_embeddings: dict[str, list[float]] | None = None
 def _get_gov_category_embeddings(
     model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict[str, list[float]]:
     global _gov_category_embeddings
-    if _gov_category_embeddings is not None:
+    if item_configs is None and _gov_category_embeddings is not None:
         return _gov_category_embeddings
 
     model = model or EMBEDDING_MODEL
     dimensions = dimensions or EMBEDDING_DIMENSIONS
+    governance_items = get_task_items("governance", item_configs)
 
-    descriptions = [
-        item["description"] for item in GOVERNANCE_EXTRACTION_ITEMS
-    ]
-    codes = [item["code"] for item in GOVERNANCE_EXTRACTION_ITEMS]
-
-    embeddings = get_embeddings(
-        descriptions, model=model, dimensions=dimensions
+    # Criteria are static (not ticker/year-specific), so precompute HyDE upfront.
+    precompute_hyde2_embeddings(
+        [item["description"] for item in governance_items],
+        embedding_model=model,
+        dimensions=dimensions,
     )
-    _gov_category_embeddings = dict(zip(codes, embeddings))
-    return _gov_category_embeddings
+
+    embeddings: dict[str, list[float]] = {}
+    for item in governance_items:
+        code = item["code"]
+        description = item["description"]
+        embeddings[code] = build_hyde2_embedding(
+            description,
+            embedding_model=model,
+            dimensions=dimensions,
+        )
+    if item_configs is None:
+        _gov_category_embeddings = embeddings
+    return embeddings
 
 
 def reset_gov_category_embeddings_cache() -> None:
@@ -398,13 +414,14 @@ def retrieve_chunks_for_gov_item(
     top_k: int | None = None,
     model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> list[dict]:
     """Retrieve top-k most relevant chunks for a governance extraction item."""
     top_k = top_k or INFERENCE_TOP_K
     dimensions = dimensions or EMBEDDING_DIMENSIONS
 
     cat_embeddings = _get_gov_category_embeddings(
-        model=model, dimensions=dimensions
+        model=model, dimensions=dimensions, item_configs=item_configs
     )
     if item_code not in cat_embeddings:
         raise ValueError(f"Unknown governance item code: {item_code}")
@@ -643,7 +660,7 @@ _OUTPUT_FORMATS: dict[str, str] = {
 
 _GOV_ITEM_OUTPUT_TEMPLATES: dict[str, str] = {
     item["code"]: item.get("json_template", "")
-    for item in GOVERNANCE_EXTRACTION_ITEMS
+    for item in GOVERNANCE_ITEMS
     if item.get("json_template")
 }
 
@@ -1180,6 +1197,59 @@ def _build_gov_prompt(
     )
 
 
+def _save_governance_request_inputs(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    ticker: str,
+    year: int,
+    model: str,
+    batch_id: str,
+    prompts: dict[str, str],
+) -> None:
+    rows: list[tuple] = []
+    for code, prompt in prompts.items():
+        request_body = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            },
+            ensure_ascii=False,
+        )
+        rows.append(
+            (
+                "governance",
+                ticker,
+                year,
+                code,
+                model,
+                batch_id,
+                request_body,
+                prompt,
+            )
+        )
+
+    if not rows:
+        return
+
+    con.executemany(
+        """
+        INSERT INTO llm_request_inputs (
+            task_type,
+            ticker,
+            year,
+            item_code,
+            model,
+            batch_id,
+            request_body,
+            prompt_text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Computed governance variables
 # ---------------------------------------------------------------------------
@@ -1326,6 +1396,7 @@ def create_governance_jobs(
     years: list[int] | None = None,
     replace: bool = False,
     inference_model: str | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> int:
     """Create pending governance extraction jobs for embedded reports."""
     inference_model = inference_model or INFERENCE_MODEL
@@ -1341,7 +1412,7 @@ def create_governance_jobs(
     if years:
         embedded = [(t, y) for t, y in embedded if y in years]
 
-    total_items = len(GOVERNANCE_EXTRACTION_ITEMS)
+    total_items = len(get_task_items("governance", item_configs))
     created = 0
     for ticker, year in embedded:
         existing = con.execute(
@@ -1458,9 +1529,10 @@ def sync_governance_job_states(
     con: duckdb.DuckDBPyConnection,
     *,
     model: str | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict[str, int]:
     """Sync governance job statuses with actual results in DB."""
-    total_items = len(GOVERNANCE_EXTRACTION_ITEMS)
+    total_items = len(get_task_items("governance", item_configs))
 
     query = (
         "SELECT id, ticker, year, model, status, items_done "
@@ -1477,7 +1549,7 @@ def sync_governance_job_states(
 
     for job_id, ticker, year, job_model, status, done in jobs:
         row = con.execute(
-            "SELECT COUNT(*) FROM governance_results "
+            f"SELECT COUNT(*) FROM {GOV_RESULTS_WRITE_TABLE} "
             "WHERE ticker = ? AND year = ? AND model = ?",
             [ticker, year, job_model],
         ).fetchone()
@@ -1537,7 +1609,7 @@ def delete_governance_jobs(
     if conditions:
         where = " WHERE " + " AND ".join(conditions)
 
-    con.execute(f"DELETE FROM governance_results{where}", params)
+    con.execute(f"DELETE FROM {GOV_RESULTS_WRITE_TABLE}{where}", params)
     con.execute(f"DELETE FROM governance_jobs{where}", params)
 
 
@@ -1574,7 +1646,7 @@ def get_governance_results(
         SELECT id, ticker, year, item_code, found, value_json,
                details_json, reason, top_chunks, similarities,
                model, created_at
-        FROM governance_results
+        FROM {GOV_RESULTS_TABLE}
         {where}
         ORDER BY ticker, year, item_code
         """,
@@ -1614,6 +1686,7 @@ def extract_governance(
     embedding_model: str | None = None,
     dimensions: int | None = None,
     item_codes: list[str] | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> int:
     """Run governance extraction for a single annual report.
 
@@ -1632,25 +1705,23 @@ def extract_governance(
     ticker = ticker.upper()
     top_k = top_k or INFERENCE_TOP_K
     inference_model = inference_model or INFERENCE_MODEL
+    governance_items = get_task_items("governance", item_configs)
 
     # Determine items to extract
     if item_codes:
-        alias_map = {
-            "GOV_BOARD": "GOV_DIRECTORY",
-        }
-        normalized_item_codes = [alias_map.get(code, code) for code in item_codes]
-        valid_codes = {it["code"] for it in GOVERNANCE_EXTRACTION_ITEMS}
+        normalized_item_codes = normalize_item_codes("governance", item_codes)
+        valid_codes = {it["code"] for it in governance_items}
         unknown = set(normalized_item_codes) - valid_codes
         if unknown:
             raise ValueError(f"Unknown governance item codes: {unknown}")
         items_to_eval = [
             it
-            for it in GOVERNANCE_EXTRACTION_ITEMS
+            for it in governance_items
             if it["code"] in normalized_item_codes
         ]
         item_codes = normalized_item_codes
     else:
-        items_to_eval = GOVERNANCE_EXTRACTION_ITEMS
+        items_to_eval = governance_items
 
     # Ensure job row exists
     existing_job = con.execute(
@@ -1659,7 +1730,7 @@ def extract_governance(
         [ticker, year, inference_model],
     ).fetchone()
 
-    total_items = len(GOVERNANCE_EXTRACTION_ITEMS)
+    total_items = len(governance_items)
 
     if existing_job is None:
         con.execute(
@@ -1720,7 +1791,7 @@ def extract_governance(
                 raise RuntimeError(msg)
 
             output_map = get_batch_output_map(client, batch_id)
-            by_code = {it["code"]: it for it in GOVERNANCE_EXTRACTION_ITEMS}
+            by_code = {it["code"]: it for it in governance_items}
             done_now = 0
             for code, raw in output_map.items():
                 item = by_code.get(code)
@@ -1737,6 +1808,7 @@ def extract_governance(
                     top_k=gov_top_k,
                     model=embedding_model,
                     dimensions=dimensions,
+                    item_configs=governance_items,
                 )
                 try:
                     parsed = json.loads(raw)
@@ -1757,7 +1829,7 @@ def extract_governance(
 
                 con.execute(
                     """
-                    INSERT INTO governance_results
+                    INSERT INTO governance_results_hyde2
                         (id, ticker, year, item_code, found, value_json,
                          details_json, reason, top_chunks, similarities, model)
                     VALUES
@@ -1788,7 +1860,7 @@ def extract_governance(
                 done_now += 1
 
             total_results = con.execute(
-                "SELECT COUNT(*) FROM governance_results "
+                f"SELECT COUNT(*) FROM {GOV_RESULTS_WRITE_TABLE} "
                 "WHERE ticker = ? AND year = ? AND model = ?",
                 [ticker, year, inference_model],
             ).fetchone()
@@ -1837,14 +1909,14 @@ def extract_governance(
             if item_codes:
                 placeholders = ",".join(["?"] * len(item_codes))
                 con.execute(
-                    "DELETE FROM governance_results "
+                    f"DELETE FROM {GOV_RESULTS_WRITE_TABLE} "
                     "WHERE ticker = ? AND year = ? AND model = ? "
                     f"AND item_code IN ({placeholders})",
                     [ticker, year, inference_model, *item_codes],
                 )
             else:
                 con.execute(
-                    "DELETE FROM governance_results "
+                    f"DELETE FROM {GOV_RESULTS_WRITE_TABLE} "
                     "WHERE ticker = ? AND year = ? AND model = ?",
                     [ticker, year, inference_model],
                 )
@@ -1856,7 +1928,7 @@ def extract_governance(
 
             if not replace:
                 existing = con.execute(
-                    "SELECT 1 FROM governance_results "
+                    f"SELECT 1 FROM {GOV_RESULTS_WRITE_TABLE} "
                     "WHERE ticker = ? AND year = ? AND item_code = ? "
                     "AND model = ?",
                     [ticker, year, code, inference_model],
@@ -1875,6 +1947,7 @@ def extract_governance(
                 top_k=gov_top_k,
                 model=embedding_model,
                 dimensions=dimensions,
+                item_configs=governance_items,
             )
 
             if not chunks:
@@ -1891,7 +1964,7 @@ def extract_governance(
 
                 con.execute(
                     """
-                    INSERT INTO governance_results
+                    INSERT INTO governance_results_hyde2
                         (id, ticker, year, item_code, found, value_json,
                          details_json, reason, top_chunks, similarities, model)
                     VALUES
@@ -1933,6 +2006,14 @@ def extract_governance(
                 is_reasoning=is_reasoning,
                 temperature=INFERENCE_TEMPERATURE,
             )
+            _save_governance_request_inputs(
+                con,
+                ticker=ticker,
+                year=year,
+                model=inference_model,
+                batch_id=new_batch_id,
+                prompts=prompts,
+            )
             con.execute(
                 """
                 UPDATE governance_jobs
@@ -1957,7 +2038,7 @@ def extract_governance(
 
         # Check completion
         total_results = con.execute(
-            "SELECT COUNT(*) FROM governance_results "
+            f"SELECT COUNT(*) FROM {GOV_RESULTS_WRITE_TABLE} "
             "WHERE ticker = ? AND year = ? AND model = ?",
             [ticker, year, inference_model],
         ).fetchone()
@@ -2030,6 +2111,7 @@ def extract_governance_all(
     inference_model: str | None = None,
     embedding_model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict:
     """Run governance extraction for every pending job."""
     con = get_connection()
@@ -2037,7 +2119,12 @@ def extract_governance_all(
 
     _model = inference_model or INFERENCE_MODEL
 
-    create_governance_jobs(con, replace=replace, inference_model=_model)
+    create_governance_jobs(
+        con,
+        replace=replace,
+        inference_model=_model,
+        item_configs=item_configs,
+    )
 
     pending = get_governance_jobs(con, status="pending", model=_model)
     results: dict = {"evaluated": [], "skipped": [], "failed": []}
@@ -2057,6 +2144,7 @@ def extract_governance_all(
                 inference_model=inference_model,
                 embedding_model=embedding_model,
                 dimensions=dimensions,
+                item_configs=item_configs,
             )
             if n > 0:
                 results["evaluated"].append((ticker, year, n))

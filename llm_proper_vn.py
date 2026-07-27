@@ -19,6 +19,7 @@ from datetime import datetime
 import duckdb
 from openai import OpenAI
 
+from annual_inference_config import get_task_items
 from config import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
@@ -26,12 +27,12 @@ from config import (
     INFERENCE_MODEL,
     INFERENCE_TEMPERATURE,
     INFERENCE_TOP_K,
-    PROPER_VN_ALL_ITEMS,
     PROPER_VN_STAGE1_ITEMS,
     PROPER_VN_STAGE2_ITEMS,
 )
 from database import ensure_vss_loaded, get_connection
 from embedder import _get_client, get_embeddings
+from hyde_retrieval import build_hyde2_embedding, precompute_hyde2_embeddings
 from llm_batch_api import (
     get_batch_output_map,
     get_batch_status,
@@ -48,6 +49,8 @@ except Exception:  # pragma: no cover
 
 
 MAX_PROMPT_CONTENT_TOKENS = 120000
+PROPER_RESULTS_TABLE = "proper_vn_results"
+PROPER_RESULTS_WRITE_TABLE = "proper_vn_results_hyde2"
 
 
 def _is_token_limit_error(exc: Exception) -> bool:
@@ -66,13 +69,14 @@ def _is_token_limit_error(exc: Exception) -> bool:
 
 def get_proper_vn_items() -> list[dict[str, str]]:
     """Return all PROPER-VN checklist items (Stage 1 + Stage 2)."""
-    return PROPER_VN_ALL_ITEMS
+    return get_task_items("proper_vn")
 
 
 def get_proper_vn_groups() -> dict[str, list[dict]]:
     """Return PROPER-VN items grouped by stage."""
+    proper_items = get_task_items("proper_vn")
     groups: dict[str, list[dict]] = {}
-    for item in PROPER_VN_ALL_ITEMS:
+    for item in proper_items:
         groups.setdefault(item["group"], []).append(item)
     return groups
 
@@ -87,21 +91,34 @@ _proper_category_embeddings: dict[str, list[float]] | None = None
 def _get_proper_category_embeddings(
     model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict[str, list[float]]:
     global _proper_category_embeddings
-    if _proper_category_embeddings is not None:
+    if item_configs is None and _proper_category_embeddings is not None:
         return _proper_category_embeddings
 
     model = model or EMBEDDING_MODEL
     dimensions = dimensions or EMBEDDING_DIMENSIONS
+    proper_items = get_task_items("proper_vn", item_configs)
 
-    descriptions = [item["description"] for item in PROPER_VN_ALL_ITEMS]
-    codes = [item["code"] for item in PROPER_VN_ALL_ITEMS]
-
-    embeddings = get_embeddings(
-        descriptions, model=model, dimensions=dimensions
+    # Criteria are static (not ticker/year-specific), so precompute HyDE upfront.
+    precompute_hyde2_embeddings(
+        [item["description"] for item in proper_items],
+        embedding_model=model,
+        dimensions=dimensions,
     )
-    _proper_category_embeddings = dict(zip(codes, embeddings))
+
+    embeddings: dict[str, list[float]] = {}
+    for item in proper_items:
+        code = item["code"]
+        description = item["description"]
+        embeddings[code] = build_hyde2_embedding(
+            description,
+            embedding_model=model,
+            dimensions=dimensions,
+        )
+    if item_configs is None:
+        _proper_category_embeddings = embeddings
     return _proper_category_embeddings
 
 
@@ -124,13 +141,14 @@ def retrieve_chunks_for_indicator(
     top_k: int | None = None,
     model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> list[dict]:
     """Retrieve top-k most relevant chunks for a PROPER-VN indicator."""
     top_k = top_k or INFERENCE_TOP_K
     dimensions = dimensions or EMBEDDING_DIMENSIONS
 
     cat_embeddings = _get_proper_category_embeddings(
-        model=model, dimensions=dimensions
+        model=model, dimensions=dimensions, item_configs=item_configs
     )
     if indicator_code not in cat_embeddings:
         raise ValueError(f"Unknown PROPER-VN indicator: {indicator_code}")
@@ -347,6 +365,59 @@ def _build_proper_prompt(chunks: list[dict], indicator_description: str) -> str:
     )
 
 
+def _save_proper_request_inputs(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    ticker: str,
+    year: int,
+    model: str,
+    batch_id: str,
+    prompts: dict[str, str],
+) -> None:
+    rows: list[tuple] = []
+    for code, prompt in prompts.items():
+        request_body = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            },
+            ensure_ascii=False,
+        )
+        rows.append(
+            (
+                "proper_vn",
+                ticker,
+                year,
+                code,
+                model,
+                batch_id,
+                request_body,
+                prompt,
+            )
+        )
+
+    if not rows:
+        return
+
+    con.executemany(
+        """
+        INSERT INTO llm_request_inputs (
+            task_type,
+            ticker,
+            year,
+            item_code,
+            model,
+            batch_id,
+            request_body,
+            prompt_text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
 def _parse_proper_raw(raw: str) -> dict:
     try:
         result = json.loads(raw)
@@ -460,6 +531,7 @@ def create_proper_vn_jobs(
     years: list[int] | None = None,
     replace: bool = False,
     inference_model: str | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> int:
     """Create pending PROPER-VN jobs for embedded reports."""
     inference_model = inference_model or INFERENCE_MODEL
@@ -475,7 +547,7 @@ def create_proper_vn_jobs(
     if years:
         embedded = [(t, y) for t, y in embedded if y in years]
 
-    total_indicators = len(PROPER_VN_ALL_ITEMS)
+    total_indicators = len(get_task_items("proper_vn", item_configs))
     created = 0
     for ticker, year in embedded:
         existing = con.execute(
@@ -595,9 +667,10 @@ def sync_proper_vn_job_states(
     con: duckdb.DuckDBPyConnection,
     *,
     model: str | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict[str, int]:
     """Sync PROPER-VN job statuses with actual results in DB."""
-    total_indicators = len(PROPER_VN_ALL_ITEMS)
+    total_indicators = len(get_task_items("proper_vn", item_configs))
 
     query = (
         "SELECT id, ticker, year, model, status, indicators_done "
@@ -614,7 +687,7 @@ def sync_proper_vn_job_states(
 
     for job_id, ticker, year, job_model, status, done in jobs:
         row = con.execute(
-            "SELECT COUNT(*) FROM proper_vn_results "
+            f"SELECT COUNT(*) FROM {PROPER_RESULTS_WRITE_TABLE} "
             "WHERE ticker = ? AND year = ? AND model = ?",
             [ticker, year, job_model],
         ).fetchone()
@@ -674,7 +747,7 @@ def delete_proper_vn_jobs(
     if conditions:
         where = " WHERE " + " AND ".join(conditions)
 
-    con.execute(f"DELETE FROM proper_vn_results{where}", params)
+    con.execute(f"DELETE FROM {PROPER_RESULTS_WRITE_TABLE}{where}", params)
     con.execute(f"DELETE FROM proper_vn_jobs{where}", params)
 
 
@@ -711,7 +784,7 @@ def get_proper_vn_results(
         SELECT id, ticker, year, indicator_code, is_present,
                evidence_level, reason, top_chunks, similarities,
                model, created_at
-        FROM proper_vn_results
+        FROM {PROPER_RESULTS_TABLE}
         {where}
         ORDER BY ticker, year, indicator_code
         """,
@@ -749,6 +822,7 @@ def infer_proper_vn_report(
     inference_model: str | None = None,
     embedding_model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict:
     """Run PROPER-VN inference for a single annual report.
 
@@ -766,7 +840,8 @@ def infer_proper_vn_report(
     ticker = ticker.upper()
     top_k = top_k or INFERENCE_TOP_K
     inference_model = inference_model or INFERENCE_MODEL
-    total_indicators = len(PROPER_VN_ALL_ITEMS)
+    proper_items = get_task_items("proper_vn", item_configs)
+    total_indicators = len(proper_items)
 
     # ── Ensure a job row exists ──────────────────────────────────────────
     existing_job = con.execute(
@@ -840,7 +915,7 @@ def infer_proper_vn_report(
                 raise RuntimeError(msg)
 
             output_map = get_batch_output_map(client, batch_id)
-            by_code = {it["code"]: it for it in PROPER_VN_ALL_ITEMS}
+            by_code = {it["code"]: it for it in proper_items}
 
             for code, raw in output_map.items():
                 if code not in by_code:
@@ -853,6 +928,7 @@ def infer_proper_vn_report(
                     top_k=top_k,
                     model=embedding_model,
                     dimensions=dimensions,
+                    item_configs=proper_items,
                 )
                 result = _parse_proper_raw(raw)
                 similarities_json = json.dumps([round(c["distance"], 6) for c in chunks])
@@ -860,7 +936,7 @@ def infer_proper_vn_report(
 
                 con.execute(
                     """
-                    INSERT INTO proper_vn_results
+                    INSERT INTO proper_vn_results_hyde2
                         (id, ticker, year, indicator_code, is_present,
                          evidence_level, reason, top_chunks, similarities, model)
                     VALUES
@@ -889,7 +965,7 @@ def infer_proper_vn_report(
 
             rows = con.execute(
                 "SELECT indicator_code, is_present, evidence_level, reason "
-                "FROM proper_vn_results WHERE ticker = ? AND year = ? AND model = ?",
+                f"FROM {PROPER_RESULTS_WRITE_TABLE} WHERE ticker = ? AND year = ? AND model = ?",
                 [ticker, year, inference_model],
             ).fetchall()
             all_indicator_results = {
@@ -970,7 +1046,7 @@ def infer_proper_vn_report(
         # Optionally clear previous results for this model
         if replace:
             con.execute(
-                "DELETE FROM proper_vn_results "
+                f"DELETE FROM {PROPER_RESULTS_WRITE_TABLE} "
                 "WHERE ticker = ? AND year = ? AND model = ?",
                 [ticker, year, inference_model],
             )
@@ -979,14 +1055,14 @@ def infer_proper_vn_report(
         all_indicator_results: dict[str, dict] = {}
         prompts: dict[str, str] = {}
 
-        for item in PROPER_VN_ALL_ITEMS:
+        for item in proper_items:
             code = item["code"]
 
             # Skip if result exists (unless replacing)
             if not replace:
                 existing = con.execute(
                     "SELECT is_present, evidence_level, reason "
-                    "FROM proper_vn_results "
+                    f"FROM {PROPER_RESULTS_WRITE_TABLE} "
                     "WHERE ticker = ? AND year = ? AND indicator_code = ? "
                     "AND model = ?",
                     [ticker, year, code, inference_model],
@@ -1009,6 +1085,7 @@ def infer_proper_vn_report(
                 top_k=top_k,
                 model=embedding_model,
                 dimensions=dimensions,
+                item_configs=proper_items,
             )
 
             if not chunks:
@@ -1022,7 +1099,7 @@ def infer_proper_vn_report(
                 top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
                 con.execute(
                     """
-                    INSERT INTO proper_vn_results
+                    INSERT INTO proper_vn_results_hyde2
                         (id, ticker, year, indicator_code, is_present,
                          evidence_level, reason, top_chunks, similarities, model)
                     VALUES
@@ -1061,6 +1138,14 @@ def infer_proper_vn_report(
                 prompts=prompts,
                 is_reasoning=is_reasoning,
                 temperature=INFERENCE_TEMPERATURE,
+            )
+            _save_proper_request_inputs(
+                con,
+                ticker=ticker,
+                year=year,
+                model=inference_model,
+                batch_id=new_batch_id,
+                prompts=prompts,
             )
             con.execute(
                 """
@@ -1157,6 +1242,7 @@ def infer_proper_vn_all(
     inference_model: str | None = None,
     embedding_model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict:
     """Run PROPER-VN inference for every pending job.
 
@@ -1166,7 +1252,12 @@ def infer_proper_vn_all(
     ensure_vss_loaded(con)
 
     _model = inference_model or INFERENCE_MODEL
-    create_proper_vn_jobs(con, replace=replace, inference_model=_model)
+    create_proper_vn_jobs(
+        con,
+        replace=replace,
+        inference_model=_model,
+        item_configs=item_configs,
+    )
 
     pending = get_proper_vn_jobs(con, status="pending", model=_model)
     results = {"evaluated": [], "skipped": [], "failed": []}
@@ -1186,6 +1277,7 @@ def infer_proper_vn_all(
                 inference_model=inference_model,
                 embedding_model=embedding_model,
                 dimensions=dimensions,
+                item_configs=item_configs,
             )
             results["evaluated"].append(
                 (ticker, year, classification["color"])

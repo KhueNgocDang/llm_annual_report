@@ -19,8 +19,8 @@ from datetime import datetime
 import duckdb
 from openai import OpenAI
 
+from annual_inference_config import get_task_items
 from config import (
-    CHECKLIST_ITEMS,
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     ENV_JSON_PATH,
@@ -30,6 +30,7 @@ from config import (
 )
 from database import ensure_vss_loaded, get_connection
 from embedder import _get_client, get_embeddings
+from hyde_retrieval import build_hyde2_embedding, precompute_hyde2_embeddings
 from llm_batch_api import (
     get_batch_output_map,
     get_batch_status,
@@ -46,6 +47,8 @@ except Exception:  # pragma: no cover
 
 
 MAX_PROMPT_CONTENT_TOKENS = 120000
+INFERENCE_RESULTS_TABLE = "inference_results"
+INFERENCE_RESULTS_WRITE_TABLE = "inference_results_hyde2"
 
 
 def _is_token_limit_error(exc: Exception) -> bool:
@@ -64,13 +67,14 @@ def _is_token_limit_error(exc: Exception) -> bool:
 
 def get_checklist() -> list[dict[str, str]]:
     """Return the full Environmental Disclosure Checklist."""
-    return CHECKLIST_ITEMS
+    return get_task_items("edc")
 
 
 def get_checklist_groups() -> dict[str, list[dict]]:
     """Return checklist items grouped by their group name."""
+    checklist_items = get_task_items("edc")
     groups: dict[str, list[dict]] = {}
-    for item in CHECKLIST_ITEMS:
+    for item in checklist_items:
         groups.setdefault(item["group"], []).append(item)
     return groups
 
@@ -85,26 +89,39 @@ _category_embeddings: dict[str, list[float]] | None = None
 def _get_category_embeddings(
     model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict[str, list[float]]:
     """Return a dict mapping category code → embedding vector.
 
     Embeddings are cached in-process so they're only computed once.
     """
     global _category_embeddings
-    if _category_embeddings is not None:
+    if item_configs is None and _category_embeddings is not None:
         return _category_embeddings
 
     model = model or EMBEDDING_MODEL
     dimensions = dimensions or EMBEDDING_DIMENSIONS
+    checklist_items = get_task_items("edc", item_configs)
 
-    descriptions = [item["description"] for item in CHECKLIST_ITEMS]
-    codes = [item["code"] for item in CHECKLIST_ITEMS]
-
-    embeddings = get_embeddings(
-        descriptions, model=model, dimensions=dimensions
+    # Criteria are static (not ticker/year-specific), so precompute HyDE upfront.
+    precompute_hyde2_embeddings(
+        [item["description"] for item in checklist_items],
+        embedding_model=model,
+        dimensions=dimensions,
     )
-    _category_embeddings = dict(zip(codes, embeddings))
-    return _category_embeddings
+
+    embeddings: dict[str, list[float]] = {}
+    for item in checklist_items:
+        code = item["code"]
+        description = item["description"]
+        embeddings[code] = build_hyde2_embedding(
+            description,
+            embedding_model=model,
+            dimensions=dimensions,
+        )
+    if item_configs is None:
+        _category_embeddings = embeddings
+    return embeddings
 
 
 def reset_category_embeddings_cache() -> None:
@@ -127,6 +144,7 @@ def retrieve_chunks_for_category(
     top_k: int | None = None,
     model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> list[dict]:
     """Retrieve the top-k most relevant chunks for a checklist category.
 
@@ -140,7 +158,7 @@ def retrieve_chunks_for_category(
     dimensions = dimensions or EMBEDDING_DIMENSIONS
 
     cat_embeddings = _get_category_embeddings(
-        model=model, dimensions=dimensions
+        model=model, dimensions=dimensions, item_configs=item_configs
     )
     if category_code not in cat_embeddings:
         raise ValueError(f"Unknown category code: {category_code}")
@@ -180,12 +198,13 @@ _EVAL_PROMPT = """You are a helpful assistant designed to validate the content o
 
 - Translate the text to English.
 
-**Return only a JSON object** with the following two properties:
+**Return only a JSON object** with the following properties:
 
 - `"is_valid"`: a boolean (`true` or `false`) indicating whether the text matches the criteria.
 - `"reason"`: Provide a brief explanation on why the text data is valid or not.
+- `"citations"`: an array of `chunk_index` integers that support your answer. Use only indices that appear in the input block.
 
-Both JSON properties must always be present.
+All JSON properties must always be present.
 
 Do not include any additional text or explanations outside the JSON object.
 
@@ -198,6 +217,17 @@ CRITERIA
 ```
 {criteria}
 ```"""
+
+
+def _format_reason_with_citations(reason: str, citations: list[int]) -> str:
+    if not citations:
+        return reason
+    unique_sorted = sorted(set(citations))
+    refs = ", ".join(str(i) for i in unique_sorted)
+    suffix = f" [citations: {refs}]"
+    if suffix in reason:
+        return reason
+    return f"{reason}{suffix}".strip()
 
 
 def evaluate_category(
@@ -240,14 +270,16 @@ def evaluate_category(
         text = str(chunk.get("chunk_text") or "")
         if not text:
             continue
+        chunk_index = int(chunk.get("chunk_index") or -1)
         token_count = int(chunk.get("token_count") or _estimate_tokens(text))
         if used_tokens + token_count <= MAX_PROMPT_CONTENT_TOKENS:
-            selected_chunks.append(text)
+            selected_chunks.append(f"[chunk_index={chunk_index}]\n{text}")
             used_tokens += token_count
             continue
         remain = MAX_PROMPT_CONTENT_TOKENS - used_tokens
         if remain > 0 and not selected_chunks:
-            selected_chunks.append(_truncate_text_tokens(text, remain))
+            truncated = _truncate_text_tokens(text, remain)
+            selected_chunks.append(f"[chunk_index={chunk_index}]\n{truncated}")
             used_tokens += remain
         break
 
@@ -310,11 +342,23 @@ def evaluate_category(
         result = {
             "is_valid": False,
             "reason": f"Failed to parse LLM response: {raw}",
+            "citations": [],
         }
+
+    citations = [
+        int(c)
+        for c in (result.get("citations") or [])
+        if isinstance(c, int) or (isinstance(c, str) and c.strip().lstrip("-").isdigit())
+    ]
+    reason = _format_reason_with_citations(
+        str(result.get("reason", "")),
+        citations,
+    )
 
     return {
         "is_valid": bool(result.get("is_valid", False)),
-        "reason": str(result.get("reason", "")),
+        "reason": reason,
+        "citations": citations,
     }
 
 
@@ -345,14 +389,16 @@ def _build_eval_prompt(chunks: list[dict], category_description: str) -> str:
         text = str(chunk.get("chunk_text") or "")
         if not text:
             continue
+        chunk_index = int(chunk.get("chunk_index") or -1)
         token_count = int(chunk.get("token_count") or _estimate_tokens(text))
         if used_tokens + token_count <= MAX_PROMPT_CONTENT_TOKENS:
-            selected_chunks.append(text)
+            selected_chunks.append(f"[chunk_index={chunk_index}]\n{text}")
             used_tokens += token_count
             continue
         remain = MAX_PROMPT_CONTENT_TOKENS - used_tokens
         if remain > 0 and not selected_chunks:
-            selected_chunks.append(_truncate_text_tokens(text, remain))
+            truncated = _truncate_text_tokens(text, remain)
+            selected_chunks.append(f"[chunk_index={chunk_index}]\n{truncated}")
         break
 
     if not selected_chunks:
@@ -369,11 +415,83 @@ def _parse_eval_raw(raw: str) -> dict:
         result = {
             "is_valid": False,
             "reason": f"Failed to parse LLM response: {raw}",
+            "citations": [],
         }
+
+    citations = [
+        int(c)
+        for c in (result.get("citations") or [])
+        if isinstance(c, int) or (isinstance(c, str) and c.strip().lstrip("-").isdigit())
+    ]
+    reason = _format_reason_with_citations(
+        str(result.get("reason", "")),
+        citations,
+    )
+
     return {
         "is_valid": bool(result.get("is_valid", False)),
-        "reason": str(result.get("reason", "")),
+        "reason": reason,
+        "citations": citations,
     }
+
+
+def _save_edc_request_inputs(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    ticker: str,
+    year: int,
+    model: str,
+    batch_id: str,
+    prompts: dict[str, str],
+) -> None:
+    """Save exact EDC request inputs sent to OpenAI for audit/debug."""
+    task_type = (
+        "edc_alt"
+        if prompts and all(str(code).endswith("_alt") for code in prompts.keys())
+        else "edc"
+    )
+    rows: list[tuple] = []
+    for code, prompt in prompts.items():
+        request_body = json.dumps(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            },
+            ensure_ascii=False,
+        )
+        rows.append(
+            (
+                task_type,
+                ticker,
+                year,
+                code,
+                model,
+                batch_id,
+                request_body,
+                prompt,
+            )
+        )
+
+    if not rows:
+        return
+
+    con.executemany(
+        """
+        INSERT INTO llm_request_inputs (
+            task_type,
+            ticker,
+            year,
+            item_code,
+            model,
+            batch_id,
+            request_body,
+            prompt_text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +506,7 @@ def create_inference_jobs(
     years: list[int] | None = None,
     replace: bool = False,
     inference_model: str | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> int:
     """Create pending inference jobs for embedded reports.
 
@@ -411,7 +530,7 @@ def create_inference_jobs(
         embedded = [(t, y) for t, y in embedded if y in years]
 
     created = 0
-    total_cats = len(CHECKLIST_ITEMS)
+    total_cats = len(get_task_items("edc", item_configs))
     for ticker, year in embedded:
         existing = con.execute(
             "SELECT status FROM inference_jobs "
@@ -529,6 +648,7 @@ def sync_inference_job_states(
     con: duckdb.DuckDBPyConnection,
     *,
     model: str | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict[str, int]:
     """Sync inference job statuses with actual results in the database.
 
@@ -541,7 +661,7 @@ def sync_inference_job_states(
     Returns ``{"completed": N, "updated": M}`` — how many jobs were
     flipped to completed and how many had their progress updated.
     """
-    total_cats = len(CHECKLIST_ITEMS)
+    total_cats = len(get_task_items("edc", item_configs))
 
     query = (
         "SELECT id, ticker, year, model, status, categories_done "
@@ -560,7 +680,7 @@ def sync_inference_job_states(
     for job_id, ticker, year, job_model, status, cats_done in jobs:
         # Count results that exist for this (ticker, year, model)
         row = con.execute(
-            "SELECT COUNT(*) FROM inference_results "
+            f"SELECT COUNT(*) FROM {INFERENCE_RESULTS_WRITE_TABLE} "
             "WHERE ticker = ? AND year = ? AND model = ?",
             [ticker, year, job_model],
         ).fetchone()
@@ -624,8 +744,8 @@ def delete_inference_jobs(
     if conditions:
         where = " WHERE " + " AND ".join(conditions)
 
-    # Also delete corresponding inference_results
-    con.execute(f"DELETE FROM inference_results{where}", params)
+    # Also delete corresponding inference_results for HyDe-2 writes.
+    con.execute(f"DELETE FROM {INFERENCE_RESULTS_WRITE_TABLE}{where}", params)
     con.execute(f"DELETE FROM inference_jobs{where}", params)
 
 
@@ -662,7 +782,7 @@ def get_inference_results(
         f"""
         SELECT id, ticker, year, category_code, is_valid, reason,
                top_chunks, similarities, model, created_at
-        FROM inference_results
+        FROM {INFERENCE_RESULTS_TABLE}
         {where}
         ORDER BY ticker, year, category_code
         """,
@@ -700,6 +820,7 @@ def infer_report(
     embedding_model: str | None = None,
     dimensions: int | None = None,
     category_codes: list[str] | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> int:
     """Run checklist inference for a single annual report.
 
@@ -726,18 +847,19 @@ def infer_report(
     ticker = ticker.upper()
     top_k = top_k or INFERENCE_TOP_K
     inference_model = inference_model or INFERENCE_MODEL
+    checklist_items = get_task_items("edc", item_configs)
 
     # Determine which checklist items to evaluate
     if category_codes:
-        valid_codes = {it["code"] for it in CHECKLIST_ITEMS}
+        valid_codes = {it["code"] for it in checklist_items}
         unknown = set(category_codes) - valid_codes
         if unknown:
             raise ValueError(f"Unknown category codes: {unknown}")
         items_to_eval = [
-            it for it in CHECKLIST_ITEMS if it["code"] in category_codes
+            it for it in checklist_items if it["code"] in category_codes
         ]
     else:
-        items_to_eval = CHECKLIST_ITEMS
+        items_to_eval = checklist_items
 
     # ── Ensure an inference_jobs row exists ───────────────────────────────
     existing_job = con.execute(
@@ -746,7 +868,7 @@ def infer_report(
         [ticker, year, inference_model],
     ).fetchone()
 
-    total_cats = len(CHECKLIST_ITEMS)
+    total_cats = len(checklist_items)
 
     if existing_job is None:
         con.execute(
@@ -808,7 +930,7 @@ def infer_report(
 
             output_map = get_batch_output_map(client, batch_id)
             done_now = 0
-            by_code = {it["code"]: it for it in CHECKLIST_ITEMS}
+            by_code = {it["code"]: it for it in checklist_items}
 
             for code, raw in output_map.items():
                 item = by_code.get(code)
@@ -823,6 +945,7 @@ def infer_report(
                     top_k=top_k,
                     model=embedding_model,
                     dimensions=dimensions,
+                    item_configs=checklist_items,
                 )
                 result = _parse_eval_raw(raw)
 
@@ -831,7 +954,7 @@ def infer_report(
 
                 con.execute(
                     """
-                    INSERT INTO inference_results
+                    INSERT INTO inference_results_hyde2
                         (id, ticker, year, category_code, is_valid, reason,
                          top_chunks, similarities, model)
                     VALUES
@@ -858,7 +981,7 @@ def infer_report(
                 done_now += 1
 
             total_results = con.execute(
-                "SELECT COUNT(*) FROM inference_results "
+                f"SELECT COUNT(*) FROM {INFERENCE_RESULTS_WRITE_TABLE} "
                 "WHERE ticker = ? AND year = ? AND model = ?",
                 [ticker, year, inference_model],
             ).fetchone()
@@ -903,7 +1026,7 @@ def infer_report(
         # Optionally clear previous results for this model
         if replace:
             con.execute(
-                "DELETE FROM inference_results "
+                f"DELETE FROM {INFERENCE_RESULTS_WRITE_TABLE} "
                 "WHERE ticker = ? AND year = ? AND model = ?",
                 [ticker, year, inference_model],
             )
@@ -916,7 +1039,7 @@ def infer_report(
             # Skip if result already exists for this model (unless replacing)
             if not replace:
                 existing = con.execute(
-                    "SELECT 1 FROM inference_results "
+                    f"SELECT 1 FROM {INFERENCE_RESULTS_WRITE_TABLE} "
                     "WHERE ticker = ? AND year = ? AND category_code = ? "
                     "AND model = ?",
                     [ticker, year, code, inference_model],
@@ -934,6 +1057,7 @@ def infer_report(
                 top_k=top_k,
                 model=embedding_model,
                 dimensions=dimensions,
+                item_configs=checklist_items,
             )
 
             if not chunks:
@@ -946,7 +1070,7 @@ def infer_report(
                 top_chunks_json = json.dumps([c["chunk_index"] for c in chunks])
                 con.execute(
                     """
-                    INSERT INTO inference_results
+                    INSERT INTO inference_results_hyde2
                         (id, ticker, year, category_code, is_valid, reason,
                          top_chunks, similarities, model)
                     VALUES
@@ -985,6 +1109,14 @@ def infer_report(
                 is_reasoning=is_reasoning,
                 temperature=INFERENCE_TEMPERATURE,
             )
+            _save_edc_request_inputs(
+                con,
+                ticker=ticker,
+                year=year,
+                model=inference_model,
+                batch_id=new_batch_id,
+                prompts=prompts,
+            )
             con.execute(
                 """
                 UPDATE inference_jobs
@@ -1010,7 +1142,7 @@ def infer_report(
 
         # Mark job completed (or update progress if partial run)
         total_results = con.execute(
-            "SELECT COUNT(*) FROM inference_results "
+            f"SELECT COUNT(*) FROM {INFERENCE_RESULTS_WRITE_TABLE} "
             "WHERE ticker = ? AND year = ? AND model = ?",
             [ticker, year, inference_model],
         ).fetchone()
@@ -1081,6 +1213,7 @@ def infer_all(
     inference_model: str | None = None,
     embedding_model: str | None = None,
     dimensions: int | None = None,
+    item_configs: list[dict[str, str]] | None = None,
 ) -> dict:
     """Run inference for every pending inference job.
 
@@ -1105,7 +1238,12 @@ def infer_all(
     _model = inference_model or INFERENCE_MODEL
 
     # Ensure jobs exist for all embedded reports (scoped to model)
-    create_inference_jobs(con, replace=replace, inference_model=_model)
+    create_inference_jobs(
+        con,
+        replace=replace,
+        inference_model=_model,
+        item_configs=item_configs,
+    )
 
     pending = get_inference_jobs(con, status="pending", model=_model)
     results = {"evaluated": [], "skipped": [], "failed": []}
@@ -1125,6 +1263,7 @@ def infer_all(
                 inference_model=inference_model,
                 embedding_model=embedding_model,
                 dimensions=dimensions,
+                item_configs=item_configs,
             )
             if n > 0:
                 results["evaluated"].append((ticker, year, n))

@@ -8,27 +8,26 @@ DATA_STUDIO_SQL_TEMPLATES: dict[str, str] = {
     "Governance Board Metrics": """
 WITH base AS (
     SELECT DISTINCT ticker, year, model
-    FROM governance_results
+    FROM governance_results_hyde2
 ),
 dir AS (
     SELECT ticker, year, model, value_json, details_json
-    FROM governance_results
+    FROM governance_results_hyde2
     WHERE item_code = 'GOV_DIRECTORY'
 ),
 exec AS (
     SELECT ticker, year, model, value_json, details_json
-    FROM governance_results
+    FROM governance_results_hyde2
     WHERE item_code = 'GOV_EXECUTIVE'
 ),
 sup AS (
     SELECT ticker, year, model, value_json, details_json
-    FROM governance_results
+    FROM governance_results_hyde2
     WHERE item_code = 'GOV_SUPERVISORY'
 ),
 aud AS (
     SELECT ticker, year, model, value_json
-    FROM governance_results
-    WHERE item_code = 'GOV_AUDIT'
+    FROM bctc_audit_results
 )
 SELECT
     b.ticker,
@@ -66,13 +65,13 @@ LIMIT 200
 """.strip(),
     "Latest Governance Results": """
 SELECT ticker, year, item_code, model, created_at
-FROM governance_results
+FROM governance_results_hyde2
 ORDER BY created_at DESC
 LIMIT 100
 """.strip(),
     "Governance Item Coverage": """
 SELECT item_code, COUNT(*) AS rows_count, COUNT(DISTINCT ticker) AS ticker_count
-FROM governance_results
+FROM governance_results_hyde2
 GROUP BY item_code
 ORDER BY rows_count DESC
 """.strip(),
@@ -127,26 +126,26 @@ ORDER BY ticker, year DESC
     "Board/Governance Profile (EXE/DIR/AGE/ISO/WOMAN/SUPERVISOR)": """
 WITH base AS (
     SELECT DISTINCT ticker, year, model
-    FROM governance_results
+    FROM governance_results_hyde2
 ),
 dir AS (
     SELECT ticker, year, model, details_json
-    FROM governance_results
+    FROM governance_results_hyde2
     WHERE item_code = 'GOV_DIRECTORY'
 ),
 exe AS (
     SELECT ticker, year, model, details_json
-    FROM governance_results
+    FROM governance_results_hyde2
     WHERE item_code = 'GOV_EXECUTIVE'
 ),
 sup AS (
     SELECT ticker, year, model, details_json
-    FROM governance_results
+    FROM governance_results_hyde2
     WHERE item_code = 'GOV_SUPERVISORY'
 ),
 iso AS (
     SELECT ticker, year, model, MAX(CASE WHEN is_present THEN 1 ELSE 0 END) AS iso_flag
-    FROM proper_vn_results
+    FROM proper_vn_results_hyde2
     WHERE indicator_code = 'S2_ISO14001'
     GROUP BY ticker, year, model
 )
@@ -196,7 +195,7 @@ WITH proper AS (
         MAX(CASE WHEN indicator_code = 'S1_VIOLATION' AND is_present THEN 1 ELSE 0 END) AS proper_env_violation,
         SUM(CASE WHEN is_present THEN 1 ELSE 0 END) AS proper_present_count,
         COUNT(*) AS proper_total_indicators
-    FROM proper_vn_results
+    FROM proper_vn_results_hyde2
     GROUP BY ticker, year, model
 ),
 edc_ghg AS (
@@ -213,7 +212,7 @@ edc_ghg AS (
         MAX(CASE WHEN category_code = 'GHG5' AND is_valid THEN 1 ELSE 0 END) AS ghg5_by_source,
         MAX(CASE WHEN category_code = 'GHG6' AND is_valid THEN 1 ELSE 0 END) AS ghg6_by_facility,
         MAX(CASE WHEN category_code = 'GHG7' AND is_valid THEN 1 ELSE 0 END) AS ghg7_historical_comparison
-    FROM inference_results
+    FROM inference_results_hyde2
     WHERE category_code IN ('GHG1', 'GHG2', 'GHG3', 'GHG4', 'GHG5', 'GHG6', 'GHG7')
     GROUP BY ticker, year, model
 ),

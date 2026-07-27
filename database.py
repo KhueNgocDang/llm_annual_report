@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 import duckdb
 
-from config import DB_PATH
+from config import DATA_DIR, DB_PATH
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS stocks (
@@ -104,6 +105,15 @@ CREATE TABLE IF NOT EXISTS annual_reports (
     PRIMARY KEY (ticker, year)
 );
 
+CREATE TABLE IF NOT EXISTS bctc_reports (
+    ticker      VARCHAR NOT NULL,
+    year        INTEGER NOT NULL,
+    content     VARCHAR NOT NULL,
+    source_file VARCHAR NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, year)
+);
+
 CREATE TABLE IF NOT EXISTS pipeline_files (
     ticker     VARCHAR NOT NULL,
     year       INTEGER NOT NULL,
@@ -149,6 +159,38 @@ CREATE TABLE IF NOT EXISTS document_embeddings (
     PRIMARY KEY (ticker, year, chunk_index)
 );
 
+CREATE TABLE IF NOT EXISTS bctc_document_embeddings (
+    ticker      VARCHAR NOT NULL,
+    year        INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    chunk_text  VARCHAR NOT NULL,
+    token_count INTEGER,
+    embedding   FLOAT[],
+    model       VARCHAR,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, year, chunk_index)
+);
+
+CREATE SEQUENCE IF NOT EXISTS bctc_audit_results_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS bctc_audit_results (
+    id                    INTEGER PRIMARY KEY DEFAULT nextval('bctc_audit_results_id_seq'),
+    ticker                VARCHAR NOT NULL,
+    year                  INTEGER NOT NULL,
+    found                 BOOLEAN NOT NULL,
+    audit_firm            VARCHAR,
+    audit_opinion         VARCHAR,
+    signing_auditor_names VARCHAR,
+    value_json            VARCHAR,
+    details_json          VARCHAR,
+    reason                VARCHAR,
+    top_chunks            VARCHAR,
+    similarities          VARCHAR,
+    model                 VARCHAR NOT NULL,
+    created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (ticker, year, model)
+);
+
 CREATE SEQUENCE IF NOT EXISTS inference_jobs_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS inference_results_id_seq START 1;
 
@@ -172,6 +214,20 @@ CREATE TABLE IF NOT EXISTS inference_jobs (
 );
 
 CREATE TABLE IF NOT EXISTS inference_results (
+    id            INTEGER PRIMARY KEY DEFAULT nextval('inference_results_id_seq'),
+    ticker        VARCHAR NOT NULL,
+    year          INTEGER NOT NULL,
+    category_code VARCHAR NOT NULL,
+    is_valid      BOOLEAN NOT NULL,
+    reason        VARCHAR,
+    top_chunks    VARCHAR,
+    similarities  VARCHAR,
+    model         VARCHAR NOT NULL,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (ticker, year, category_code, model)
+);
+
+CREATE TABLE IF NOT EXISTS inference_results_hyde2 (
     id            INTEGER PRIMARY KEY DEFAULT nextval('inference_results_id_seq'),
     ticker        VARCHAR NOT NULL,
     year          INTEGER NOT NULL,
@@ -225,6 +281,21 @@ CREATE TABLE IF NOT EXISTS proper_vn_results (
     UNIQUE (ticker, year, indicator_code, model)
 );
 
+CREATE TABLE IF NOT EXISTS proper_vn_results_hyde2 (
+    id             INTEGER PRIMARY KEY DEFAULT nextval('proper_vn_results_id_seq'),
+    ticker         VARCHAR NOT NULL,
+    year           INTEGER NOT NULL,
+    indicator_code VARCHAR NOT NULL,
+    is_present     BOOLEAN NOT NULL,
+    evidence_level VARCHAR,
+    reason         VARCHAR,
+    top_chunks     VARCHAR,
+    similarities   VARCHAR,
+    model          VARCHAR NOT NULL,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (ticker, year, indicator_code, model)
+);
+
 CREATE SEQUENCE IF NOT EXISTS governance_jobs_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS governance_results_id_seq START 1;
 
@@ -248,6 +319,22 @@ CREATE TABLE IF NOT EXISTS governance_jobs (
 );
 
 CREATE TABLE IF NOT EXISTS governance_results (
+    id           INTEGER PRIMARY KEY DEFAULT nextval('governance_results_id_seq'),
+    ticker       VARCHAR NOT NULL,
+    year         INTEGER NOT NULL,
+    item_code    VARCHAR NOT NULL,
+    found        BOOLEAN NOT NULL,
+    value_json   VARCHAR,
+    details_json VARCHAR,
+    reason       VARCHAR,
+    top_chunks   VARCHAR,
+    similarities VARCHAR,
+    model        VARCHAR NOT NULL,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (ticker, year, item_code, model)
+);
+
+CREATE TABLE IF NOT EXISTS governance_results_hyde2 (
     id           INTEGER PRIMARY KEY DEFAULT nextval('governance_results_id_seq'),
     ticker       VARCHAR NOT NULL,
     year         INTEGER NOT NULL,
@@ -308,6 +395,21 @@ CREATE TABLE IF NOT EXISTS llm_model_presets (
     is_active    BOOLEAN NOT NULL DEFAULT TRUE,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (task_type, model_name)
+);
+
+CREATE SEQUENCE IF NOT EXISTS llm_request_inputs_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS llm_request_inputs (
+    id            INTEGER PRIMARY KEY DEFAULT nextval('llm_request_inputs_id_seq'),
+    task_type     VARCHAR NOT NULL,
+    ticker        VARCHAR,
+    year          INTEGER,
+    item_code     VARCHAR,
+    model         VARCHAR NOT NULL,
+    batch_id      VARCHAR,
+    request_body  VARCHAR NOT NULL,
+    prompt_text   VARCHAR NOT NULL,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS company_history_events (
@@ -395,11 +497,121 @@ _MIGRATION_SQL = [
 
 _INIT_DB_LOCK = threading.Lock()
 _INIT_DB_DONE = False
+_LEGACY_RESULTS_DIR = DATA_DIR / "parquet" / "legacy_llm_results"
+_RESULT_MIGRATIONS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    (
+        "inference_results",
+        "inference_results_hyde2",
+        "inference_results_legacy",
+        ("ticker", "year", "category_code", "model"),
+    ),
+    (
+        "proper_vn_results",
+        "proper_vn_results_hyde2",
+        "proper_vn_results_legacy",
+        ("ticker", "year", "indicator_code", "model"),
+    ),
+    (
+        "governance_results",
+        "governance_results_hyde2",
+        "governance_results_legacy",
+        ("ticker", "year", "item_code", "model"),
+    ),
+)
 
 
-def get_connection() -> duckdb.DuckDBPyConnection:
+def _sql_quote_path(path: Path) -> str:
+    return str(path).replace("'", "''")
+
+
+def _get_table_type(
+    con: duckdb.DuckDBPyConnection,
+    object_name: str,
+) -> str | None:
+    row = con.execute(
+        """
+        SELECT table_type
+        FROM information_schema.tables
+        WHERE table_schema = current_schema()
+          AND table_name = ?
+        """,
+        [object_name],
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def _ensure_parquet_snapshot_from_table(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    table_name: str,
+    parquet_path: Path,
+) -> None:
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    quoted_path = _sql_quote_path(parquet_path)
+    con.execute(
+        f"COPY (SELECT * FROM {table_name}) TO '{quoted_path}' (FORMAT PARQUET)"
+    )
+
+
+def _ensure_parquet_snapshot_from_new_table(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    new_table_name: str,
+    parquet_path: Path,
+) -> None:
+    if parquet_path.exists():
+        return
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    quoted_path = _sql_quote_path(parquet_path)
+    con.execute(
+        "COPY (SELECT * FROM "
+        f"{new_table_name} WHERE 1 = 0) TO '{quoted_path}' (FORMAT PARQUET)"
+    )
+
+
+def _migrate_results_to_hyde2_views(con: duckdb.DuckDBPyConnection) -> None:
+    """Move legacy result rows to Parquet and expose backward-compatible views."""
+    for legacy_name, hyde2_name, legacy_view_name, key_columns in _RESULT_MIGRATIONS:
+        parquet_path = _LEGACY_RESULTS_DIR / f"{legacy_name}.parquet"
+        object_type = _get_table_type(con, legacy_name)
+
+        if object_type == "BASE TABLE":
+            _ensure_parquet_snapshot_from_table(
+                con,
+                table_name=legacy_name,
+                parquet_path=parquet_path,
+            )
+            con.execute(f"DROP TABLE {legacy_name}")
+        else:
+            _ensure_parquet_snapshot_from_new_table(
+                con,
+                new_table_name=hyde2_name,
+                parquet_path=parquet_path,
+            )
+
+        quoted_path = _sql_quote_path(parquet_path)
+        con.execute(
+            f"CREATE OR REPLACE VIEW {legacy_view_name} AS "
+            f"SELECT * FROM read_parquet('{quoted_path}')"
+        )
+
+        key_predicate = " AND ".join(
+            f"h.{col} = l.{col}" for col in key_columns
+        )
+        con.execute(
+            f"CREATE OR REPLACE VIEW {legacy_name} AS "
+            f"SELECT * FROM {hyde2_name} "
+            "UNION ALL "
+            f"SELECT l.* FROM {legacy_view_name} l "
+            "WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {hyde2_name} h WHERE {key_predicate}"
+            ")"
+        )
+
+
+def get_connection(read_only: bool = False) -> duckdb.DuckDBPyConnection:
     """Return a DuckDB connection to the project database."""
-    return duckdb.connect(str(DB_PATH))
+    return duckdb.connect(str(DB_PATH), read_only=read_only)
 
 
 def init_db(con: duckdb.DuckDBPyConnection | None = None) -> None:
@@ -425,6 +637,7 @@ def init_db(con: duckdb.DuckDBPyConnection | None = None) -> None:
                 try:
                     for stmt in _MIGRATION_SQL:
                         con.execute(stmt)
+                    _migrate_results_to_hyde2_views(con)
                     break
                 except duckdb.TransactionException as exc:
                     # Another concurrent writer may still be applying ALTER statements.
@@ -481,7 +694,7 @@ def delete_company(
         Dict mapping table name -> number of rows deleted.
     """
     import shutil
-    from config import RAW_DIR
+    from config import BCTC_MARKDOWN_DIR, RAW_DIR
     from config_marker import MARKDOWN_DIR
 
     t = ticker.upper()
@@ -492,7 +705,10 @@ def delete_company(
         ("company_history_summary", "ticker"),
         ("conversion_jobs", "ticker"),
         ("annual_reports", "ticker"),
+        ("bctc_reports", "ticker"),
         ("pipeline_files", "ticker"),
+        ("bctc_document_embeddings", "ticker"),
+        ("bctc_audit_results", "ticker"),
         ("vietstock_documents", "ticker"),
         ("financial_ratios", "code"),
         ("financial_statements", "code"),
@@ -507,7 +723,7 @@ def delete_company(
 
     # Clean up files on disk
     files_removed = 0
-    for d in [RAW_DIR / t, MARKDOWN_DIR / t]:
+    for d in [RAW_DIR / t, MARKDOWN_DIR / t, BCTC_MARKDOWN_DIR / t]:
         if d.is_dir():
             files_removed += sum(1 for _ in d.rglob("*") if _.is_file())
             shutil.rmtree(d)

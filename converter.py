@@ -11,15 +11,21 @@ import os
 import re
 import signal
 import subprocess
+import time
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional, TypedDict
 
 import duckdb
 
-from config import OUTPUT_DIR, RAW_DIR
+from config import BCTC_MARKDOWN_DIR, OUTPUT_DIR, RAW_DIR
 from config_marker import DATA_DIR, MARKDOWN_DIR, LOGS_DIR, MARKER_EXTRA_ARGS
 from database import ensure_company, get_connection
+from vietstock_documents import (
+    DOC_TYPE_ANNUAL_REPORT,
+    DOC_TYPE_AUDITED_CONSOLIDATED_FS,
+)
 
 import shutil
 
@@ -28,6 +34,22 @@ import shutil
 # ---------------------------------------------------------------------------
 
 _RAW_REPORT_PATTERN = r"^Báo cáo thường niên năm (\d{4})\s*\.pdf$"
+
+
+def _job_kind_from_output_dir(output_dir: str | Path) -> str:
+    """Infer converter job kind from output directory path."""
+    try:
+        resolved = Path(output_dir).resolve()
+    except Exception:
+        resolved = Path(output_dir)
+    return "bctc" if resolved == Path(BCTC_MARKDOWN_DIR).resolve() else "annual"
+
+
+def _default_output_dir_for_doc_type(doc_type: str) -> Path:
+    """Map Vietstock doc_type to converter output root directory."""
+    if str(doc_type) == DOC_TYPE_AUDITED_CONSOLIDATED_FS:
+        return Path(BCTC_MARKDOWN_DIR)
+    return Path(MARKDOWN_DIR)
 
 
 class RawInputEntry(TypedDict):
@@ -416,6 +438,7 @@ def create_jobs(
     years: list[int] | None = None,
     start_year: int | None = None,
     end_year: int | None = None,
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
     output_dir: str | Path | None = None,
 ) -> int:
     """Create pending conversion jobs from downloaded PDFs.
@@ -435,7 +458,12 @@ def create_jobs(
     Returns:
         Number of jobs created.
     """
-    output_dir = str(output_dir or MARKDOWN_DIR)
+    if str(doc_type) != DOC_TYPE_ANNUAL_REPORT:
+        raise ValueError(
+            "conversion_jobs supports annual reports only; use convert_bctc_to_markdown for BCTC management"
+        )
+
+    output_dir = str(output_dir or _default_output_dir_for_doc_type(doc_type))
 
     query = """
         SELECT vd.ticker, vd.title, vd.raw_path
@@ -443,8 +471,9 @@ def create_jobs(
         WHERE vd.synced_to_raw = TRUE
           AND vd.raw_path IS NOT NULL
           AND vd.raw_path != ''
+                    AND vd.doc_type = ?
     """
-    params: list = []
+    params: list = [str(doc_type)]
 
     if tickers:
         placeholders = ", ".join(["?" for _ in tickers])
@@ -570,12 +599,238 @@ def _pdf_needs_ocr(
         doc.close()
 
 
+def _find_manual_pdf_candidate(
+    search_dir: Path,
+    *,
+    ticker: str | None = None,
+    year: int | None = None,
+    preferred_stem: str | None = None,
+) -> Path | None:
+    """Find a likely manually extracted PDF in *search_dir*.
+
+    Ranking priority:
+    - filename contains year
+    - filename contains ticker
+    - filename contains original source stem
+    If there is only one PDF, use it directly.
+    """
+    if not search_dir.exists() or not search_dir.is_dir():
+        return None
+
+    pdfs = sorted(path for path in search_dir.glob("*.pdf") if path.is_file())
+    if not pdfs:
+        return None
+    if len(pdfs) == 1:
+        return pdfs[0]
+
+    ticker_text = str(ticker or "").strip().upper()
+    year_text = str(int(year)) if year is not None else ""
+    stem_text = str(preferred_stem or "").strip().lower()
+
+    def _score(path: Path) -> tuple[int, int]:
+        name_upper = path.name.upper()
+        name_lower = path.name.lower()
+        score = 0
+        if year_text and year_text in name_upper:
+            score += 5
+        if ticker_text and ticker_text in name_upper:
+            score += 3
+        if stem_text and stem_text in name_lower:
+            score += 2
+        # Tie-break by shorter filename as a weak proxy for canonical doc file.
+        return (score, -len(path.name))
+
+    ranked = sorted(pdfs, key=_score, reverse=True)
+    best = ranked[0]
+    if _score(best)[0] <= 0:
+        return None
+    return best
+
+
+def _resolve_source_pdf(
+    source_path: str | Path,
+    *,
+    ticker: str | None = None,
+    year: int | None = None,
+    allow_manual_updated_files: bool = False,
+) -> Path:
+    """Resolve a conversion source into a readable PDF path.
+
+    Supports:
+    - direct PDF files
+    - ZIP archives containing at least one PDF
+    - sibling .pdf next to non-pdf source names
+    - optional fallback to manually extracted/renamed PDFs in source folder
+    """
+    src = Path(source_path)
+
+    search_dirs: list[Path] = []
+    if src.parent.exists() and src.parent.is_dir():
+        search_dirs.append(src.parent)
+    extracted_dir = src.parent / "_extracted"
+    if extracted_dir.exists() and extracted_dir.is_dir():
+        search_dirs.append(extracted_dir)
+
+    if not src.exists():
+        if allow_manual_updated_files:
+            candidate = None
+            for search_dir in search_dirs:
+                candidate = _find_manual_pdf_candidate(
+                    search_dir,
+                    ticker=ticker,
+                    year=year,
+                    preferred_stem=src.stem,
+                )
+                if candidate is not None:
+                    return candidate
+        raise FileNotFoundError(f"Source file not found: {src}")
+
+    if src.suffix.lower() == ".pdf":
+        return src
+
+    sibling_pdf = src.with_suffix(".pdf")
+    if sibling_pdf.exists():
+        return sibling_pdf
+
+    def _zip_pdf_language_score(filename: str) -> int:
+        """Score PDF member names to prefer Vietnamese-language report files."""
+        name = Path(filename).name.lower()
+        # Tokenize by common separators so markers like "_vi_" are matched reliably.
+        tokens = [t for t in re.split(r"[^a-z0-9]+", name) if t]
+        token_set = set(tokens)
+
+        score = 0
+        if "vi" in token_set or "vietnamese" in token_set:
+            score += 10
+        if "en" in token_set or "english" in token_set:
+            score -= 10
+
+        # Common Vietnamese report wording often appears in unaccented filenames.
+        vi_markers = {
+            "bao",
+            "cao",
+            "tai",
+            "chinh",
+            "hop",
+            "nhat",
+            "kiem",
+            "toan",
+            "thuyet",
+            "minh",
+            "viet",
+            "nam",
+        }
+        score += sum(1 for marker in vi_markers if marker in token_set)
+
+        # English report wording reduces priority when both language variants exist.
+        en_markers = {
+            "audited",
+            "consolidated",
+            "financial",
+            "statements",
+            "statement",
+            "report",
+            "notes",
+            "note",
+            "english",
+        }
+        score -= sum(1 for marker in en_markers if marker in token_set)
+        return score
+
+    if src.suffix.lower() == ".zip":
+        extract_dir = src.parent / "_extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(src, "r") as zf:
+            pdf_members = [
+                info
+                for info in zf.infolist()
+                if not info.is_dir() and info.filename.lower().endswith(".pdf")
+            ]
+            if not pdf_members:
+                raise ValueError(f"No PDF found inside ZIP: {src}")
+
+            # Filter out tiny supplemental PDFs before applying language preference.
+            max_size = max(info.file_size for info in pdf_members)
+            primary_members = [
+                info
+                for info in pdf_members
+                if info.file_size >= max(1, int(max_size * 0.6))
+            ]
+            if not primary_members:
+                primary_members = pdf_members
+
+            # Prefer Vietnamese filenames (e.g., "vi" markers), then larger payloads.
+            member = max(
+                primary_members,
+                key=lambda info: (
+                    _zip_pdf_language_score(info.filename),
+                    info.file_size,
+                    -len(info.filename),
+                ),
+            )
+            target_pdf = extract_dir / f"{src.stem}.pdf"
+            with zf.open(member) as rf, open(target_pdf, "wb") as wf:
+                wf.write(rf.read())
+            return target_pdf
+
+    if allow_manual_updated_files:
+        candidate = None
+        for search_dir in search_dirs:
+            candidate = _find_manual_pdf_candidate(
+                search_dir,
+                ticker=ticker,
+                year=year,
+                preferred_stem=src.stem,
+            )
+            if candidate is not None:
+                return candidate
+
+    raise ValueError(f"Unsupported source format for marker conversion: {src}")
+
+
+def _wait_with_log_heartbeat(
+    proc: subprocess.Popen,
+    log_file,
+    heartbeat_seconds: float = 8.0,
+    heartbeat_callback: Callable[[int], None] | None = None,
+) -> int:
+    """Wait for a subprocess while appending periodic liveness markers to log."""
+    started_at = time.monotonic()
+    next_heartbeat_at = started_at + heartbeat_seconds
+
+    while True:
+        return_code = proc.poll()
+        if return_code is not None:
+            return int(return_code)
+
+        now = time.monotonic()
+        if now >= next_heartbeat_at:
+            elapsed = int(now - started_at)
+            log_file.write(
+                f"[heartbeat] marker is still running... elapsed={elapsed}s\n"
+            )
+            log_file.flush()
+            if heartbeat_callback is not None:
+                try:
+                    heartbeat_callback(elapsed)
+                except Exception:
+                    pass
+            next_heartbeat_at = now + heartbeat_seconds
+
+        # Keep loop lightweight while preserving frequent heartbeat updates.
+        time.sleep(0.5)
+
+
 # ---------------------------------------------------------------------------
 # Job execution
 # ---------------------------------------------------------------------------
 
 
-def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
+def run_job(
+    con: duckdb.DuckDBPyConnection,
+    job_id: int,
+    on_heartbeat: Callable[[int], None] | None = None,
+) -> bool:
     """Run a single conversion job using marker_single.
 
     Streams stdout/stderr to a log file in real-time.
@@ -599,13 +854,8 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
         rerun_reason,
     ) = row
 
-    # Ensure the source file has a .pdf extension (some downloads have .zip/.rar etc.)
-    src = Path(source_path)
-    if src.suffix.lower() != ".pdf":
-        pdf_path = src.with_suffix(".pdf")
-        if src.exists() and not pdf_path.exists():
-            src.rename(pdf_path)
-        source_path = str(pdf_path)
+    source_pdf = _resolve_source_pdf(source_path)
+    source_path = str(source_pdf)
 
     # Build output directory per ticker
     out_dir = Path(output_dir) / ticker
@@ -613,7 +863,8 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
 
     # Prepare log file
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOGS_DIR / f"job_{job_id}.log"
+    job_kind = _job_kind_from_output_dir(output_dir)
+    log_path = LOGS_DIR / f"{job_kind}_job_{job_id}.log"
 
     cmd = [
         "marker_single",
@@ -652,7 +903,9 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
 
     try:
         with open(log_path, "w") as log_file:
-            log_file.write(f"=== Job #{job_id}: {ticker} {year} ===\n")
+            log_file.write(
+                f"=== {job_kind.upper()} Job #{job_id}: {ticker} {year} ===\n"
+            )
             log_file.write(
                 f"OCR mode: {'force_ocr (manual override)' if force_ocr_override else 'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
             )
@@ -667,6 +920,7 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
                 cmd,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
 
             # Store PID for monitoring
@@ -675,14 +929,18 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
                 [proc.pid, job_id],
             )
 
-            proc.wait()
+            return_code = _wait_with_log_heartbeat(
+                proc,
+                log_file,
+                heartbeat_callback=on_heartbeat,
+            )
 
             log_file.write(f"\n{'=' * 60}\n")
-            log_file.write(f"Exit code: {proc.returncode}\n")
+            log_file.write(f"Exit code: {return_code}\n")
             log_file.write(f"Finished: {datetime.now().isoformat()}\n")
             log_file.flush()
 
-        if proc.returncode == 0:
+        if return_code == 0:
             con.execute(
                 """
                 UPDATE conversion_jobs
@@ -728,6 +986,187 @@ def run_job(con: duckdb.DuckDBPyConnection, job_id: int) -> bool:
             [str(e)[:2000], failed_step, job_id],
         )
         return False
+
+
+def convert_bctc_to_markdown(
+    con: duckdb.DuckDBPyConnection,
+    ticker: str,
+    year: int,
+    output_dir: str | Path | None = None,
+    allow_manual_updated_files: bool = False,
+    on_heartbeat: Callable[[int], None] | None = None,
+) -> Path:
+    """Convert latest synced BCTC PDF for ticker/year to markdown via marker_single.
+
+    This writes to a dedicated BCTC markdown directory to avoid clashing with
+    annual-report markdown ingestion.
+    """
+    rows = con.execute(
+        """
+        SELECT id, raw_path, title
+        FROM vietstock_documents
+        WHERE ticker = ?
+          AND doc_type = '1'
+          AND synced_to_raw = TRUE
+          AND raw_path IS NOT NULL
+          AND raw_path != ''
+          AND TRY_CAST(regexp_extract(title, '(\\d{4})', 1) AS INTEGER) = ?
+        ORDER BY published_date DESC, id DESC
+        """,
+        [str(ticker).upper(), int(year)],
+    ).fetchall()
+
+    if not rows:
+        raise ValueError(
+            f"No synced BCTC PDF found for {str(ticker).upper()}-{int(year)}"
+        )
+
+    def _bctc_title_quality_score(title: str | None) -> int:
+        text = str(title or "").lower()
+
+        score = 0
+        # De-prioritize adjustment/notice style files which are often partial docs.
+        for marker in (
+            "điều chỉnh",
+            "dieu chinh",
+            "đính chính",
+            "dinh chinh",
+            "giải trình",
+            "giai trinh",
+            "bổ sung",
+            "bo sung",
+            "thong bao",
+            "thông báo",
+            "phu luc",
+            "phụ lục",
+        ):
+            if marker in text:
+                score -= 20
+
+        # Prefer likely full audited financial statement titles.
+        for marker in (
+            "bao cao tai chinh",
+            "bctc",
+            "hop nhat",
+            "hợp nhất",
+            "kiem toan",
+            "kiểm toán",
+        ):
+            if marker in text:
+                score += 4
+
+        return score
+
+    best_candidate: tuple[int, int, int, int, int, str, Path] | None = None
+    best_doc_id: int | None = None
+
+    for idx, (candidate_id, candidate_source_path, candidate_title) in enumerate(rows):
+        try:
+            resolved = _resolve_source_pdf(
+                str(candidate_source_path),
+                ticker=str(ticker).upper(),
+                year=int(year),
+                allow_manual_updated_files=allow_manual_updated_files,
+            )
+        except Exception:
+            continue
+
+        size = 0
+        try:
+            size = int(resolved.stat().st_size)
+        except Exception:
+            size = 0
+
+        title_score = _bctc_title_quality_score(candidate_title)
+        has_adjustment_marker = 1 if title_score < 0 else 0
+
+        # Ranking priority:
+        # 1) non-adjustment titles
+        # 2) larger resolved PDF size
+        # 3) stronger full-report title signals
+        # 4) newer row order from SQL (earlier idx)
+        rank = (
+            -has_adjustment_marker,
+            size,
+            title_score,
+            -idx,
+            int(candidate_id),
+            str(candidate_source_path),
+            resolved,
+        )
+        if best_candidate is None or rank > best_candidate:
+            best_candidate = rank
+            best_doc_id = int(candidate_id)
+
+    if best_candidate is None or best_doc_id is None:
+        raise ValueError(
+            f"No readable BCTC source file found for {str(ticker).upper()}-{int(year)}"
+        )
+
+    doc_id = best_doc_id
+    source_file = best_candidate[-1]
+
+    out_root = Path(output_dir or BCTC_MARKDOWN_DIR)
+    out_dir = out_root / str(ticker).upper()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOGS_DIR / f"bctc_{str(ticker).upper()}_{int(year)}_{int(doc_id)}.log"
+
+    cmd = [
+        "marker_single",
+        str(source_file),
+        "--output_dir",
+        str(out_dir),
+    ]
+
+    needs_ocr = _pdf_needs_ocr(str(source_file))
+
+    for flag, value in MARKER_EXTRA_ARGS.items():
+        # Keep OCR behavior consistent with conversion jobs.
+        if flag == "force_ocr" and not needs_ocr:
+            continue
+        if isinstance(value, bool):
+            if value:
+                cmd.append(f"--{flag}")
+        else:
+            cmd.extend([f"--{flag}", str(value)])
+
+    with open(log_path, "w") as log_file:
+        log_file.write(
+            f"=== BCTC marker conversion: {str(ticker).upper()} {int(year)} (doc_id={int(doc_id)}) ===\n"
+        )
+        log_file.write(
+            f"OCR mode: {'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
+        )
+        log_file.write(f"Command: {' '.join(cmd)}\n")
+        log_file.write(f"Started: {datetime.now().isoformat()}\n")
+        log_file.write("=" * 60 + "\n\n")
+        log_file.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        return_code = _wait_with_log_heartbeat(
+            proc,
+            log_file,
+            heartbeat_callback=on_heartbeat,
+        )
+
+        log_file.write(f"\n{'=' * 60}\n")
+        log_file.write(f"Exit code: {return_code}\n")
+        log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+        log_file.flush()
+
+    if return_code != 0:
+        raise RuntimeError(
+            f"marker_single failed for BCTC {str(ticker).upper()}-{int(year)}; see {log_path}"
+        )
+
+    return out_dir
 
 
 # ---------------------------------------------------------------------------

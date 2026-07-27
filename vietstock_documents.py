@@ -1,4 +1,6 @@
 import os
+import re
+import unicodedata
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
@@ -14,13 +16,112 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 )
 
+DOC_TYPE_ANNUAL_REPORT = "2"
+DOC_TYPE_AUDITED_CONSOLIDATED_FS = "1"
 
-def list_documents(code: str = "VNM", doc_type: str = "2") -> list[dict]:
+DOC_TYPE_LABELS: dict[str, str] = {
+    DOC_TYPE_AUDITED_CONSOLIDATED_FS: "Audited Consolidated Financial Statements",
+    DOC_TYPE_ANNUAL_REPORT: "Annual Reports",
+}
+
+DEFAULT_PAGE_SIZE = 20
+
+
+def _extract_year_from_title(title: str) -> int | None:
+    """Extract 4-digit year from a document title."""
+    m = re.search(r"(\d{4})", str(title or ""))
+    if not m:
+        return None
+    year = int(m.group(1))
+    return year if 2000 <= year <= 2100 else None
+
+
+def _bctc_title_quality_score(title: str) -> int:
+    """Score BCTC titles so full audited reports rank above adjustment notices."""
+    text = _normalize_vi_text(title or "")
+    score = 0
+
+    # De-prioritize adjustment/notice style attachments.
+    for marker in (
+        "dieu chinh",
+        "dinh chinh",
+        "giai trinh",
+        "bo sung",
+        "thong bao",
+        "phu luc",
+    ):
+        if marker in text:
+            score -= 20
+
+    # Prefer likely full audited financial statements.
+    for marker in (
+        "bao cao tai chinh",
+        "bctc",
+        "hop nhat",
+        "kiem toan",
+    ):
+        if marker in text:
+            score += 4
+
+    return score
+
+
+def _normalize_vi_text(value: str) -> str:
+    """Normalize Vietnamese text for accent-insensitive matching."""
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    # Handle Vietnamese specific letter after accent stripping.
+    return text.replace("đ", "d")
+
+
+def _is_audited_annual_doc(doc: dict) -> bool:
+    """Keep audited annual financial statements (consolidated or standalone)."""
+    title = str(doc.get("Title") or doc.get("R_Title") or "")
+    full_name = str(doc.get("FullName") or doc.get("R_FullName") or "")
+    text = _normalize_vi_text(f"{title} {full_name}")
+
+    has_financial_report = (
+        "bao cao tai chinh" in text or "bctc" in text
+    )
+    has_audited = "kiem toan" in text
+    has_yearly = " nam " in f" {text} " or any(
+        str(y) in text for y in range(2000, 2101)
+    )
+
+    # Exclude interim/reviewed/parent-company docs.
+    blocked_keywords = [
+        "soat xet",
+        "quy",
+        "6 thang",
+        "9 thang",
+        "cong ty me",
+        "rieng",
+    ]
+    has_blocked = any(k in text for k in blocked_keywords)
+
+    return (
+        has_financial_report
+        and has_audited
+        and has_yearly
+        and not has_blocked
+    )
+
+
+def _list_documents_page(
+    code: str = "VNM",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
+    *,
+    page: int = 1,
+    year: int | None = None,
+) -> list[dict]:
     """List available PDF documents for a given stock code on Vietstock.
 
     Args:
         code: Stock ticker symbol (e.g. "VNM").
-        doc_type: Document type identifier ("2" = annual reports).
+        doc_type: Vietstock document type identifier.
+        page: 1-based page index for Vietstock listing API.
+        year: Optional year filter sent to Vietstock.
 
     Returns:
         Parsed JSON response from the Vietstock API.
@@ -29,7 +130,7 @@ def list_documents(code: str = "VNM", doc_type: str = "2") -> list[dict]:
 
     # 1) Load the documents page to obtain cookies and the CSRF token
     page_url = (
-        f"https://finance.vietstock.vn/{code}/documents.htm?doctype={doc_type}"
+        f"https://finance.vietstock.vn/{code}/tai-tai-lieu.htm?doctype={doc_type}"
     )
     headers_page = {"User-Agent": USER_AGENT}
 
@@ -63,8 +164,11 @@ def list_documents(code: str = "VNM", doc_type: str = "2") -> list[dict]:
     data = {
         "code": code,
         "type": doc_type,
+        "page": str(max(1, int(page))),
         "__RequestVerificationToken": verification_token,
     }
+    if year is not None:
+        data["year"] = str(int(year))
 
     post_response = session.post(api_url, headers=headers_post, data=data)
     post_response.raise_for_status()
@@ -94,6 +198,67 @@ def list_documents(code: str = "VNM", doc_type: str = "2") -> list[dict]:
         # Maybe the dict itself is a single document
         return [result]
     return []
+
+
+def list_documents(
+    code: str = "VNM",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
+    *,
+    year: int | None = None,
+) -> list[dict]:
+    """List available documents for one ticker and one document type.
+
+    Uses Vietstock pagination and returns a de-duplicated flat list.
+    """
+    first_page = _list_documents_page(code=code, doc_type=doc_type, page=1, year=year)
+    if not first_page:
+        return []
+
+    # Vietstock returns TotalRow on each item when available.
+    total_rows = 0
+    total_raw = first_page[0].get("TotalRow") if isinstance(first_page[0], dict) else 0
+    try:
+        total_rows = int(total_raw or 0)
+    except (TypeError, ValueError):
+        total_rows = 0
+
+    if total_rows > 0:
+        total_pages = max(1, (total_rows + DEFAULT_PAGE_SIZE - 1) // DEFAULT_PAGE_SIZE)
+    else:
+        total_pages = 1
+
+    docs = list(first_page)
+    for p in range(2, total_pages + 1):
+        page_docs = _list_documents_page(
+            code=code,
+            doc_type=doc_type,
+            page=p,
+            year=year,
+        )
+        if not page_docs:
+            break
+        docs.extend(page_docs)
+
+    # De-duplicate by FileInfoID or title+url fallback.
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for doc in docs:
+        file_info = doc.get("FileInfoID")
+        if file_info is not None and str(file_info).strip() != "":
+            key = f"fid:{file_info}"
+        else:
+            key = f"fallback:{doc.get('Title', '')}|{doc.get('Url', '')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(doc)
+
+    if str(doc_type) == DOC_TYPE_AUDITED_CONSOLIDATED_FS:
+        deduped = [
+            doc for doc in deduped if _is_audited_annual_doc(doc)
+        ]
+
+    return deduped
 
 
 def _extract_doc_fields(doc: dict, index: int = 0) -> dict | None:
@@ -129,7 +294,14 @@ def _extract_doc_fields(doc: dict, index: int = 0) -> dict | None:
         ),
         "source": _find(doc, "R_Source", "Source", "source"),
         "published_date": _find(
-            doc, "R_DateTime", "DateTime", "datetime", "date", "published_date"
+            doc,
+            "R_DateTime",
+            "DateTime",
+            "datetime",
+            "date",
+            "published_date",
+            "UpdateTime",
+            "LastUpdate",
         ),
         "file_url": _find(
             doc, "R_FileURL", "FileURL", "fileurl", "file_url", "Url", "url"
@@ -139,7 +311,8 @@ def _extract_doc_fields(doc: dict, index: int = 0) -> dict | None:
 
 
 def fetch_documents_preview(
-    code: str = "VNM", doc_type: str = "2"
+    code: str = "VNM",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
 ) -> tuple[pd.DataFrame, list[dict], list[dict]]:
     """Fetch documents and return a preview DataFrame, extracted rows, and raw list.
 
@@ -168,7 +341,7 @@ def save_extracted_to_db(
     con: duckdb.DuckDBPyConnection,
     extracted_rows: list[dict],
     code: str = "VNM",
-    doc_type: str = "2",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
 ) -> int:
     """Save pre-extracted document rows into the database.
 
@@ -269,7 +442,7 @@ def save_documents_to_db(
     con: duckdb.DuckDBPyConnection,
     raw_docs: list[dict],
     code: str = "VNM",
-    doc_type: str = "2",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
 ) -> int:
     """Save previously fetched documents into the database.
 
@@ -287,7 +460,7 @@ def save_documents_to_db(
 def sync_documents_to_db(
     con: duckdb.DuckDBPyConnection,
     code: str = "VNM",
-    doc_type: str = "2",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
 ) -> int:
     """Fetch documents from Vietstock and upsert them into the database.
 
@@ -425,7 +598,7 @@ def _extract_year_from_title(title: str) -> int | None:
 
 def fetch_all_companies_documents(
     con: duckdb.DuckDBPyConnection,
-    doc_type: str = "2",
+    doc_type: str = DOC_TYPE_ANNUAL_REPORT,
     tickers: list[str] | None = None,
     start_year: int | None = None,
     end_year: int | None = None,
@@ -437,7 +610,7 @@ def fetch_all_companies_documents(
 
     Args:
         con: DuckDB connection.
-        doc_type: Document type ("2" = annual reports).
+        doc_type: Vietstock document type.
         tickers: Optional list of tickers to fetch. If None, fetches all companies.
         start_year: Optional — only save documents with year >= start_year.
         end_year: Optional — only save documents with year <= end_year.
@@ -459,7 +632,37 @@ def fetch_all_companies_documents(
     results = {}
     for ticker in ticker_list:
         try:
-            raw_docs = list_documents(code=ticker, doc_type=doc_type)
+            years: list[int | None]
+            if start_year is not None and end_year is not None:
+                lower = min(start_year, end_year)
+                upper = max(start_year, end_year)
+                years = list(range(lower, upper + 1))
+            elif start_year is not None:
+                years = [start_year]
+            elif end_year is not None:
+                years = [end_year]
+            else:
+                years = [None]
+
+            raw_docs: list[dict] = []
+            for y in years:
+                raw_docs.extend(list_documents(code=ticker, doc_type=doc_type, year=y))
+
+            # De-duplicate after combining years.
+            unique_docs: list[dict] = []
+            seen_keys: set[str] = set()
+            for doc in raw_docs:
+                file_info = doc.get("FileInfoID")
+                if file_info is not None and str(file_info).strip() != "":
+                    key = f"fid:{file_info}"
+                else:
+                    key = f"fallback:{doc.get('Title', '')}|{doc.get('Url', '')}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                unique_docs.append(doc)
+            raw_docs = unique_docs
+
             if not raw_docs:
                 results[ticker] = 0
                 if on_progress:
@@ -495,6 +698,7 @@ def fetch_all_companies_documents(
 
 def download_all_unsynced(
     con: duckdb.DuckDBPyConnection,
+    doc_type: str | None = None,
     on_progress: Optional[
         Callable[[str, str, Optional[str], Optional[Exception]], None]
     ] = None,
@@ -508,17 +712,50 @@ def download_all_unsynced(
     Returns:
         Dict mapping ticker -> list of downloaded file paths.
     """
-    rows = con.execute(
-        """
-        SELECT id, ticker, title
-        FROM vietstock_documents
-        WHERE synced_to_raw = FALSE AND file_url IS NOT NULL AND file_url != ''
-        ORDER BY ticker, published_date DESC
-        """
-    ).fetchall()
+    sql = (
+        "SELECT id, ticker, title, published_date "
+        "FROM vietstock_documents "
+        "WHERE synced_to_raw = FALSE AND file_url IS NOT NULL AND file_url != '' "
+    )
+    params: list[str] = []
+    if doc_type:
+        sql += "AND doc_type = ? "
+        params.append(str(doc_type))
+    sql += "ORDER BY ticker, published_date DESC, id DESC"
+    rows = con.execute(sql, params).fetchall()
+
+    if str(doc_type or "") == DOC_TYPE_AUDITED_CONSOLIDATED_FS:
+        # Prefer full audited BCTC over adjustment notices within the same ticker/year.
+        ranked_rows: list[tuple[int, str, str, str | None]] = []
+        by_group: dict[tuple[str, int], list[tuple[int, str, str, str | None]]] = {}
+        no_year_rows: list[tuple[int, str, str, str | None]] = []
+
+        for row in rows:
+            doc_id, ticker, title, published_date = row
+            year = _extract_year_from_title(str(title or ""))
+            item = (int(doc_id), str(ticker), str(title or ""), published_date)
+            if year is None:
+                no_year_rows.append(item)
+            else:
+                by_group.setdefault((str(ticker), int(year)), []).append(item)
+
+        for group_rows in by_group.values():
+            group_rows.sort(
+                key=lambda r: (
+                    _bctc_title_quality_score(r[2]),
+                    str(r[3] or ""),
+                    r[0],
+                ),
+                reverse=True,
+            )
+            ranked_rows.extend(group_rows)
+
+        # Keep deterministic behavior for rows with missing year.
+        no_year_rows.sort(key=lambda r: (r[1], str(r[3] or ""), r[0]), reverse=True)
+        rows = ranked_rows + no_year_rows
 
     results: dict[str, list[str]] = {}
-    for doc_id, ticker, title in rows:
+    for doc_id, ticker, title, _published_date in rows:
         try:
             path = download_document_to_raw(con, doc_id)
             results.setdefault(ticker, []).append(str(path))
