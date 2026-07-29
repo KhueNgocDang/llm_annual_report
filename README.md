@@ -86,18 +86,20 @@ uv sync --extra full
 - Dash frontend is available for operations + visualization:
   - Task Runner tab to execute pipeline actions
   - Output Explorer tab with table and charts (by year, top tickers)
-  - Financial Statement Explorer tab for item trends (e.g., total assets)
+  - Financial Statement Explorer tab with curated popular metrics
 
 ## Financial Statement Visualization
 
 In Dash, open the `Financial Statement Explorer` tab to:
 
 1. Enter a ticker (for example `VNM`).
-2. Optionally enter a keyword (for example `tong tai san` or `total asset`).
-3. Load item rows and visualize:
-   - multi-line trend chart by year
-   - latest snapshot bar chart
-   - sortable summary table of latest values
+2. Select statement type:
+  - `Balance Sheet (Popular Items)`
+  - `Income Statement (Popular Items)`
+3. Load and visualize curated metrics only (for cleaner UX):
+  - trend chart by metric and year
+  - latest metric snapshot bar chart
+  - summary table with mapped item codes and latest values
 
 ## MCP-Friendly SQL Templates
 

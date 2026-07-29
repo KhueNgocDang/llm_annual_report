@@ -181,9 +181,29 @@ def _build_figures(rows: list[dict[str, str]]):
     return fig_year, fig_ticker
 
 
-def _query_financial_statement_series(
+def _popular_metric_catalog() -> dict[str, list[dict[str, list[str] | str]]]:
+    return {
+        "balance_sheet": [
+            {"key": "total_assets", "label": "Total Assets", "terms": ["total assets", "tong tai san"]},
+            {"key": "total_liabilities", "label": "Total Liabilities", "terms": ["liabilities", "no phai tra"]},
+            {"key": "total_equity", "label": "Total Equity", "terms": ["total equity", "owners equity", "von chu so huu"]},
+            {"key": "cash_equivalents", "label": "Cash & Equivalents", "terms": ["cash and cash equivalents", "tuong duong tien", "cash equivalents"]},
+            {"key": "current_assets", "label": "Current Assets", "terms": ["current assets", "tai san ngan han"]},
+            {"key": "non_current_assets", "label": "Non-current Assets", "terms": ["non-current assets", "long-term assets", "tai san dai han"]},
+        ],
+        "income_statement": [
+            {"key": "net_revenue", "label": "Net Revenue", "terms": ["net sales", "net revenue", "gross operating revenue", "doanh thu thuan"]},
+            {"key": "gross_profit", "label": "Gross Profit", "terms": ["gross profit", "loi nhuan gop"]},
+            {"key": "operating_profit", "label": "Operating Profit", "terms": ["operating profit", "loi nhuan thuan"]},
+            {"key": "profit_before_tax", "label": "Profit Before Tax", "terms": ["profit before tax", "loi nhuan truoc thue"]},
+            {"key": "profit_after_tax", "label": "Profit After Tax", "terms": ["profit after tax", "net profit after tax", "loi nhuan sau thue"]},
+            {"key": "financial_income", "label": "Financial Income", "terms": ["financial income", "thu nhap tai chinh", "doanh thu hoat dong tai chinh"]},
+        ],
+    }
+
+
+def _query_financial_statement_base(
     ticker: str,
-    keyword: str,
     start_year: int | None,
     end_year: int | None,
     limit: int,
@@ -192,7 +212,6 @@ def _query_financial_statement_series(
     if not code:
         return []
 
-    keyword_terms = _keyword_terms(keyword)
     sql = """
         WITH model_names AS (
             SELECT
@@ -234,15 +253,12 @@ def _query_financial_statement_series(
     for row in rows:
         item_code = _format_item_code(row[1])
         item_name = str(row[2] or item_code)
-        searchable_text = _normalize_text(f"{item_code} {item_name}")
-        if keyword_terms and not any(term in searchable_text for term in keyword_terms):
-            continue
         out.append(
             {
                 "ticker": str(row[0]),
                 "item_code": item_code,
                 "item_name": item_name,
-                "item_label": f"{item_code} | {item_name}",
+                "searchable": _normalize_text(f"{item_code} {item_name}"),
                 "year": int(row[3]),
                 "fiscal_date": str(row[4] or ""),
                 "value": float(row[5]),
@@ -258,27 +274,6 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", without_marks)
 
 
-def _keyword_terms(raw_keyword: str) -> list[str]:
-    normalized = _normalize_text(raw_keyword)
-    if not normalized:
-        return []
-
-    terms = {normalized}
-    alias_rules = {
-        "tai san": ["asset", "assets"],
-        "tong tai san": ["total asset", "asset"],
-        "no phai tra": ["liabil", "liability"],
-        "von chu so huu": ["equity", "owner"],
-        "doanh thu": ["revenue", "sales"],
-        "loi nhuan": ["profit", "income"],
-        "tien": ["cash"],
-    }
-    for pattern, extras in alias_rules.items():
-        if pattern in normalized:
-            terms.update(extras)
-    return sorted(terms)
-
-
 def _format_item_code(raw_item_code: object) -> str:
     text = str(raw_item_code or "").strip()
     if text.endswith(".0"):
@@ -290,39 +285,113 @@ def _empty_fs_dataframe() -> pd.DataFrame:
     return pd.DataFrame(columns=["ticker", "item_code", "item_name", "item_label", "year", "fiscal_date", "value"])
 
 
+def _build_popular_metric_rows(
+    base_rows: list[dict[str, object]],
+    statement_type: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if not base_rows:
+        return [], []
+
+    base_df = pd.DataFrame(base_rows)
+    if base_df.empty:
+        return [], []
+
+    metrics = _popular_metric_catalog().get(statement_type, [])
+    series_rows: list[dict[str, object]] = []
+    summary_rows: list[dict[str, object]] = []
+
+    for metric in metrics:
+        raw_terms = metric.get("terms", [])
+        if not isinstance(raw_terms, list):
+            continue
+        terms = [_normalize_text(str(t)) for t in raw_terms]
+        matched = base_df[base_df["searchable"].apply(lambda s: any(term in str(s) for term in terms))]
+        if matched.empty:
+            continue
+
+        grouped = (
+            matched.groupby(["item_code", "item_name"], as_index=False)
+            .agg(obs=("value", "count"), latest_year=("year", "max"))
+            .sort_values(["obs", "latest_year"], ascending=[False, False])
+        )
+        best = grouped.iloc[0]
+        best_code = str(best["item_code"])
+        best_name = str(best["item_name"])
+
+        picked = matched[matched["item_code"] == best_code].copy()
+        metric_key = str(metric.get("key", ""))
+        metric_label = str(metric.get("label", ""))
+        picked["metric_key"] = metric_key
+        picked["metric_label"] = metric_label
+        picked["item_label"] = f"{best_code} | {best_name}"
+
+        for record in picked.to_dict("records"):
+            series_rows.append(
+                {
+                    "ticker": record.get("ticker"),
+                    "item_code": record.get("item_code"),
+                    "item_name": record.get("item_name"),
+                    "searchable": record.get("searchable"),
+                    "year": record.get("year"),
+                    "fiscal_date": record.get("fiscal_date"),
+                    "value": record.get("value"),
+                    "metric_key": metric_key,
+                    "metric_label": metric_label,
+                    "item_label": record.get("item_label"),
+                }
+            )
+        summary_rows.append(
+            {
+                "metric": metric_label,
+                "item_code": best_code,
+                "item_name": best_name,
+                "observations": int(best["obs"]),
+                "latest_year": int(best["latest_year"]),
+            }
+        )
+
+    return series_rows, summary_rows
+
+
 def _build_financial_statement_figures(rows: list[dict[str, object]], selected_item_codes: list[str]):
     if not rows:
-        return _empty_fig("Item Trends"), _empty_fig("Latest Snapshot")
+        return _empty_fig("Popular Item Trends"), _empty_fig("Latest Popular Metrics")
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return _empty_fig("Item Trends"), _empty_fig("Latest Snapshot")
+        return _empty_fig("Popular Item Trends"), _empty_fig("Latest Popular Metrics")
 
-    filtered = df if not selected_item_codes else df[df["item_code"].isin(selected_item_codes)]
+    deduped = (
+        df.sort_values(["metric_label", "year", "fiscal_date"])
+        .groupby(["metric_label", "year"], as_index=False)
+        .tail(1)
+    )
+
+    filtered = deduped if not selected_item_codes else deduped[deduped["item_code"].isin(selected_item_codes)]
     if filtered.empty:
-        return _empty_fig("Item Trends"), _empty_fig("Latest Snapshot")
+        return _empty_fig("Popular Item Trends"), _empty_fig("Latest Popular Metrics")
 
     fig_trend = px.line(
         filtered,
         x="year",
         y="value",
-        color="item_label",
+        color="metric_label",
         markers=True,
-        title="Financial Statement Item Trends",
+        title="Popular Financial Statement Metrics",
     )
-    fig_trend.update_layout(template="plotly_white", legend_title_text="Item")
+    fig_trend.update_layout(template="plotly_white", legend_title_text="Metric")
 
     latest_df = (
-        filtered.sort_values(["item_code", "year"]).groupby("item_code", as_index=False).tail(1)
+        filtered.sort_values(["metric_label", "year"]).groupby("metric_label", as_index=False).tail(1)
     )
     latest_df = latest_df.sort_values("value", ascending=False).head(25)
     fig_latest = px.bar(
         latest_df,
         x="value",
-        y="item_label",
-        color="item_label",
+        y="metric_label",
+        color="metric_label",
         orientation="h",
-        title="Latest Value Snapshot",
+        title="Latest Popular Metric Snapshot",
     )
     fig_latest.update_layout(template="plotly_white", showlegend=False)
     return fig_trend, fig_latest
@@ -332,10 +401,11 @@ def _build_financial_statement_summary(rows: list[dict[str, object]]) -> list[di
     if not rows:
         return []
     df = pd.DataFrame(rows)
-    latest = df.sort_values(["item_code", "year"]).groupby("item_code", as_index=False).tail(1)
+    latest = df.sort_values(["metric_label", "year"]).groupby("metric_label", as_index=False).tail(1)
     latest = latest.sort_values("value", ascending=False)
     return [
         {
+            "metric": str(r["metric_label"]),
             "item_code": str(r["item_code"]),
             "item_name": str(r["item_name"]),
             "year": int(r["year"]),
@@ -610,22 +680,23 @@ app.layout = html.Div(
                     children=[
                         html.Div(
                             [
-                                dcc.Store(id="fs-rows-store", data=[]),
                                 html.Div(
                                     [
                                         dcc.Input(
                                             id="fs-ticker",
                                             type="text",
-                                            value="VNM",
+                                            value="CAG",
                                             placeholder="Ticker",
                                             style={"width": "120px"},
                                         ),
-                                        dcc.Input(
-                                            id="fs-keyword",
-                                            type="text",
-                                            value="tong tai san",
-                                            placeholder="Keyword (e.g. total asset)",
-                                            style={"width": "260px"},
+                                        dcc.Dropdown(
+                                            id="fs-statement-type",
+                                            options=[
+                                                {"label": "Balance Sheet (Popular Items)", "value": "balance_sheet"},
+                                                {"label": "Income Statement (Popular Items)", "value": "income_statement"},
+                                            ],
+                                            value="balance_sheet",
+                                            style={"width": "300px"},
                                         ),
                                         dcc.Input(
                                             id="fs-start-year",
@@ -652,14 +723,6 @@ app.layout = html.Div(
                                     style={"display": "flex", "gap": "8px", "flexWrap": "wrap", "marginBottom": "10px"},
                                 ),
                                 html.Div(id="fs-summary", style={"color": "#334155", "marginBottom": "8px"}),
-                                dcc.Dropdown(
-                                    id="fs-item-select",
-                                    options=[],
-                                    value=[],
-                                    multi=True,
-                                    placeholder="Select one or more item codes to chart",
-                                    style={"marginBottom": "10px"},
-                                ),
                                 html.Div(
                                     [
                                         dcc.Graph(id="fs-trend-chart", style={"height": "380px"}),
@@ -670,6 +733,7 @@ app.layout = html.Div(
                                 dash_table.DataTable(
                                     id="fs-summary-table",
                                     columns=[
+                                        {"name": "metric", "id": "metric"},
                                         {"name": "item_code", "id": "item_code"},
                                         {"name": "item_name", "id": "item_name"},
                                         {"name": "year", "id": "year"},
@@ -894,16 +958,13 @@ def refresh_kpis(_refresh_clicks: int):
 
 
 @app.callback(
-    Output("fs-rows-store", "data"),
-    Output("fs-item-select", "options"),
-    Output("fs-item-select", "value"),
     Output("fs-summary", "children"),
     Output("fs-summary-table", "data"),
     Output("fs-trend-chart", "figure"),
     Output("fs-latest-chart", "figure"),
     Input("fs-load", "n_clicks"),
     State("fs-ticker", "value"),
-    State("fs-keyword", "value"),
+    State("fs-statement-type", "value"),
     State("fs-start-year", "value"),
     State("fs-end-year", "value"),
     State("fs-limit", "value"),
@@ -912,60 +973,44 @@ def refresh_kpis(_refresh_clicks: int):
 def load_financial_statement_items(
     _clicks: int,
     ticker: str,
-    keyword: str,
+    statement_type: str,
     start_year: int,
     end_year: int,
     limit_value: int,
 ):
     safe_ticker = (ticker or "").strip().upper()
     if not safe_ticker:
-        return [], [], [], "Ticker is required.", [], _empty_fig("Item Trends"), _empty_fig("Latest Snapshot")
+        return "Ticker is required.", [], _empty_fig("Popular Item Trends"), _empty_fig("Latest Popular Metrics")
 
     if start_year is not None and end_year is not None and int(start_year) > int(end_year):
-        return [], [], [], "Invalid year range.", [], _empty_fig("Item Trends"), _empty_fig("Latest Snapshot")
+        return "Invalid year range.", [], _empty_fig("Popular Item Trends"), _empty_fig("Latest Popular Metrics")
 
     safe_limit = 3000 if limit_value is None else max(100, min(int(limit_value), 50000))
-    rows = _query_financial_statement_series(
+    base_rows = _query_financial_statement_base(
         ticker=safe_ticker,
-        keyword=keyword or "",
         start_year=int(start_year) if start_year is not None else None,
         end_year=int(end_year) if end_year is not None else None,
         limit=safe_limit,
     )
-
-    if not rows:
-        summary = f"No financial statement rows found for ticker={safe_ticker}."
-        return [], [], [], summary, [], _empty_fig("Item Trends"), _empty_fig("Latest Snapshot")
-
-    options = []
-    seen_codes: set[str] = set()
-    for row in rows:
-        code = str(row["item_code"])
-        if code in seen_codes:
-            continue
-        seen_codes.add(code)
-        options.append({"label": str(row["item_label"]), "value": code})
-
-    selected_codes = [opt["value"] for opt in options[: min(8, len(options))]]
-    fig_trend, fig_latest = _build_financial_statement_figures(rows, selected_codes)
-    summary_table = _build_financial_statement_summary(rows)
-    summary = (
-        f"Ticker={safe_ticker} | rows={len(rows)} | items={len(options)} "
-        f"| keyword={keyword or '*'}"
+    series_rows, matched_summary = _build_popular_metric_rows(
+        base_rows=base_rows,
+        statement_type=(statement_type or "balance_sheet"),
     )
-    return rows, options, selected_codes, summary, summary_table, fig_trend, fig_latest
 
+    if not series_rows:
+        summary = (
+            f"No popular metrics matched for ticker={safe_ticker} in "
+            f"{(statement_type or 'balance_sheet').replace('_', ' ')}."
+        )
+        return summary, [], _empty_fig("Popular Item Trends"), _empty_fig("Latest Popular Metrics")
 
-@app.callback(
-    Output("fs-trend-chart", "figure", allow_duplicate=True),
-    Output("fs-latest-chart", "figure", allow_duplicate=True),
-    Input("fs-item-select", "value"),
-    State("fs-rows-store", "data"),
-    prevent_initial_call=True,
-)
-def update_financial_statement_charts(selected_item_codes: list[str], rows: list[dict[str, object]]):
-    fig_trend, fig_latest = _build_financial_statement_figures(rows or [], selected_item_codes or [])
-    return fig_trend, fig_latest
+    fig_trend, fig_latest = _build_financial_statement_figures(series_rows, [])
+    summary_table = _build_financial_statement_summary(series_rows)
+    summary = (
+        f"Ticker={safe_ticker} | statement={(statement_type or 'balance_sheet').replace('_', ' ')} "
+        f"| popular_metrics={len(summary_table)} | matched_codes={len(matched_summary)}"
+    )
+    return summary, summary_table, fig_trend, fig_latest
 
 
 if __name__ == "__main__":
