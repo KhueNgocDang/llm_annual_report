@@ -86,3 +86,24 @@ uv sync --extra full
 - Dash frontend is available for operations + visualization:
   - Task Runner tab to execute pipeline actions
   - Output Explorer tab with table and charts (by year, top tickers)
+  - Financial Statement Explorer tab for item trends (e.g., total assets)
+
+## Financial Statement Visualization
+
+In Dash, open the `Financial Statement Explorer` tab to:
+
+1. Enter a ticker (for example `VNM`).
+2. Optionally enter a keyword (for example `tong tai san` or `total asset`).
+3. Load item rows and visualize:
+   - multi-line trend chart by year
+   - latest snapshot bar chart
+   - sortable summary table of latest values
+
+## MCP-Friendly SQL Templates
+
+Use [mcp_financial_statement_queries.sql](mcp_financial_statement_queries.sql) for reusable queries with the DuckDB MCP server, including:
+
+1. Discover item codes by keyword.
+2. Single-item time series for one ticker.
+3. Multi-item trend extraction by keyword.
+4. Latest balance-sheet metric snapshot.
