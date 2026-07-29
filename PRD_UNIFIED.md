@@ -122,17 +122,34 @@ Acceptance:
 1. Sync annual and BCTC listings from Vietstock.
 2. Download unsynced files into ticker-scoped raw paths.
 3. Handle pagination and metadata deduplication.
+4. Handle non-standard file delivery formats from Vietstock, including ZIP/RAR
+   archives with multiple files, bilingual file sets (VI/EN), and inconsistent
+   naming conventions.
+5. Support an optional LLM-assisted selector to choose the primary report file
+   when archive heuristics are ambiguous.
+
+Design constraints for archive resolver:
+
+1. Always attempt deterministic heuristic scoring first.
+2. Trigger LLM selector only for ambiguous multi-candidate archives.
+3. Persist `selection_method` and `selection_reason` per synced document.
+4. Store download failure reason in `sync_error` for retry triage.
+5. Prefer Vietnamese main report when archive includes both VI/EN variants.
 
 Acceptance:
 
 1. Listings and download states remain consistent across reruns.
 2. Failed downloads are logged and retryable.
+3. For archive payloads, selected output file records a selection method and
+   reason (heuristic or LLM-assisted).
 
 ### FR-4. Conversion and Content Loading
 
 1. Convert raw annual/BCTC files to markdown using marker-based OCR.
 2. Support archive/unstructured-file resolution heuristics.
 3. Load markdown content into normalized DB tables with idempotency.
+4. Normalize selected raw filename to a canonical pattern based on
+   ticker/year before downstream conversion.
 
 Acceptance:
 
@@ -237,10 +254,12 @@ Exit criteria:
 1. Stocks and company registry workflow.
 2. Financial models/statements/ratios sync.
 3. Vietstock listings + download pipeline.
+4. Archive resolver for ZIP/RAR with heuristic scoring and optional LLM assist.
 
 Exit criteria:
 
 1. Target tickers can be fully synced and raw documents downloaded.
+2. Archive payloads produce a deterministic selected PDF and audit metadata.
 
 ### Phase 2: Conversion and Loading MVP
 
@@ -297,6 +316,7 @@ P0 tasks:
 3. Annual/BCTC conversion and DB loading with idempotency.
 4. Embedding + EDC/PROPER/governance/BCTC inference base flows.
 5. UI task cards and run-state orchestration.
+6. Vietstock download resolver with VI/EN archive selection safeguards.
 
 P1 tasks:
 
@@ -304,6 +324,8 @@ P1 tasks:
 2. Section-aware filtering and hybrid reranking hardening.
 3. Batch sync reconciliation and failure recovery tools.
 4. Export-ready SQL templates and audit-centric query views.
+5. LLM-assisted filename normalization and archive candidate selection policy.
+6. RAR extraction backend hardening and operator diagnostics.
 
 P2 tasks:
 
@@ -316,7 +338,8 @@ P2 tasks:
 1. External API behavior changes.
    - Mitigation: adapter abstraction, schema validation, and guarded parsing.
 2. OCR variability in scanned or archived files.
-   - Mitigation: conversion fallback rules and quality diagnostics.
+   - Mitigation: conversion fallback rules, archive candidate scoring, and
+     optional LLM-assisted file selection with audit reason.
 3. Retrieval cross-section contamination.
    - Mitigation: benchmark-driven reranking and post-filter validators.
 4. Runtime cost and latency growth.
