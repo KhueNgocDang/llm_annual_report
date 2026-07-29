@@ -3746,6 +3746,7 @@ def page_llm_tasks():
                                 options={
                                     "edc": "EDC (Strict)",
                                     "edc_alt": "EDC (Alternative)",
+                                    "edc_alt_two": "EDC (Alternative 2)",
                                 },
                                 value="edc",
                             )
@@ -3753,7 +3754,7 @@ def page_llm_tasks():
                             .classes("w-56")
                         )
                     ui.label(
-                        "EDC Alternative uses *_alt checklist items and primes criteria embeddings before running."
+                        "EDC alternatives use *_alt and *_alt_two checklist items and prime criteria embeddings before running."
                     ).classes("text-xs text-gray-500")
 
             def _refresh_model_selects() -> None:
@@ -3861,7 +3862,11 @@ def page_llm_tasks():
 
         def _selected_edc_task_type() -> str:
             task_type = str(edc_mode_sel.value or "edc")
-            return task_type if task_type in {"edc", "edc_alt"} else "edc"
+            return (
+                task_type
+                if task_type in {"edc", "edc_alt", "edc_alt_two"}
+                else "edc"
+            )
 
         def _selected_scope() -> str:
             return str(scope_sel.value or "all")
@@ -4354,7 +4359,7 @@ def page_llm_tasks():
                     embedding_model = _selected_embed_model()
                     edc_task_type = _selected_edc_task_type()
                     edc_item_configs = (
-                        get_task_items("edc_alt") if edc_task_type == "edc_alt" else None
+                        get_task_items(edc_task_type) if edc_task_type != "edc" else None
                     )
 
                     edc_jobs = con.execute(
@@ -4595,7 +4600,7 @@ def page_llm_tasks():
                     ensure_vss_loaded(con)
                     edc_task_type = _selected_edc_task_type()
                     edc_item_configs = (
-                        get_task_items("edc_alt") if edc_task_type == "edc_alt" else None
+                        get_task_items(edc_task_type) if edc_task_type != "edc" else None
                     )
 
                     # Prime selected EDC criteria embeddings first so retrieval is ready.
@@ -4674,7 +4679,12 @@ def page_llm_tasks():
                         )
                         refresh()
 
-                    mode_label = "EDC (Alternative)" if edc_task_type == "edc_alt" else "EDC (Strict)"
+                    mode_labels = {
+                        "edc": "EDC (Strict)",
+                        "edc_alt": "EDC (Alternative)",
+                        "edc_alt_two": "EDC (Alternative 2)",
+                    }
+                    mode_label = mode_labels.get(edc_task_type, "EDC (Strict)")
                     state.summary = (
                         f"[{mode_label}] ✅ {ok} evaluated, {skip} skipped, {fail} failed"
                     )
@@ -5043,6 +5053,7 @@ def page_llm_query():
                         options={
                             "edc": "EDC Results (HyDE2)",
                             "edc_alt": "EDC Alternative Results (HyDE2)",
+                            "edc_alt_two": "EDC Alternative 2 Results (HyDE2)",
                             "proper": "PROPER-VN Results",
                             "governance": "Governance Results (Annual, no GOV_AUDIT)",
                             "bctc_audit": "BCTC Audit Results",
@@ -5135,16 +5146,26 @@ def page_llm_query():
                     else "governance_results"
                 )
 
-                if dataset in {"edc", "edc_alt"}:
+                if dataset in {"edc", "edc_alt", "edc_alt_two"}:
+                    if dataset == "edc":
+                        edc_suffix_filter = "category_code NOT LIKE ? AND category_code NOT LIKE ?"
+                        edc_suffix_params = ["%_alt", "%_alt_two"]
+                    elif dataset == "edc_alt":
+                        edc_suffix_filter = "category_code LIKE ? AND category_code NOT LIKE ?"
+                        edc_suffix_params = ["%_alt", "%_alt_two"]
+                    else:
+                        edc_suffix_filter = "category_code LIKE ?"
+                        edc_suffix_params = ["%_alt_two"]
+
                     rows = con.execute(
                         f"""
                         SELECT ticker, year, category_code, is_valid, reason, model, created_at
                         FROM {edc_table}
-                        {where}{' AND' if where else ' WHERE'} category_code {'LIKE' if dataset == 'edc_alt' else 'NOT LIKE'} ?
+                        {where}{' AND' if where else ' WHERE'} {edc_suffix_filter}
                         ORDER BY ticker, year DESC, category_code
                         LIMIT ?
                         """,
-                        params + (["%_alt"] if dataset == "edc_alt" else ["%_alt"]) + [limit],
+                        params + edc_suffix_params + [limit],
                     ).fetchall()
 
                     columns = [
@@ -5454,20 +5475,30 @@ def page_llm_query():
                 con.close()
 
             if not data:
-                if dataset == "edc_alt":
-                    strict_where = f"{where}{' AND' if where else ' WHERE'} category_code NOT LIKE ?"
+                if dataset in {"edc_alt", "edc_alt_two"}:
+                    strict_where = (
+                        f"{where}{' AND' if where else ' WHERE'} "
+                        "category_code NOT LIKE ? AND category_code NOT LIKE ?"
+                    )
                     con = get_connection()
                     try:
                         strict_row = con.execute(
                             f"SELECT COUNT(*) FROM {edc_table} {strict_where}",
-                            params + ["%_alt"],
+                            params + ["%_alt", "%_alt_two"],
                         ).fetchone()
                     finally:
                         con.close()
                     strict_count = int(strict_row[0]) if strict_row else 0
                     if strict_count > 0:
+                        alt_mode_label = (
+                            "EDC (Alternative 2)"
+                            if dataset == "edc_alt_two"
+                            else "EDC (Alternative)"
+                        )
                         ui.label(
-                            "No EDC alternative rows found for these filters. Strict EDC rows exist; run Infer EDC with mode EDC (Alternative), then Sync Running Batch Outputs."
+                            "No rows found for these filters in "
+                            f"{alt_mode_label}. Strict EDC rows exist; run Infer EDC "
+                            f"with mode {alt_mode_label}, then Sync Running Batch Outputs."
                         ).classes("text-amber-700")
                         return
                 ui.label("No extracted items found for current filters").classes(
@@ -5530,6 +5561,7 @@ def page_llm_inputs():
                             "all": "All",
                             "edc": "EDC",
                             "edc_alt": "EDC (Alternative)",
+                            "edc_alt_two": "EDC (Alternative 2)",
                             "proper_vn": "PROPER-VN",
                             "governance": "Governance",
                             "bctc_audit": "BCTC Audit",
@@ -6448,6 +6480,7 @@ def page_extract_items():
                             "all": "All",
                             "edc": "EDC",
                             "edc_alt": "EDC (Alternative)",
+                            "edc_alt_two": "EDC (Alternative 2)",
                             "proper": "PROPER-VN",
                             "governance": "Governance (Annual, no GOV_AUDIT)",
                             "bctc_audit": "BCTC Audit",
@@ -6618,7 +6651,7 @@ def page_extract_items():
                     model,
                     created_at
                 FROM {edc_table}
-                {edc_where}{' AND' if edc_where else ' WHERE'} category_code NOT LIKE '%_alt'
+                {edc_where}{' AND' if edc_where else ' WHERE'} category_code NOT LIKE '%_alt' AND category_code NOT LIKE '%_alt_two'
             """
 
             edc_alt_sql = f"""
@@ -6633,7 +6666,22 @@ def page_extract_items():
                     model,
                     created_at
                 FROM {edc_table}
-                {edc_where}{' AND' if edc_where else ' WHERE'} category_code LIKE '%_alt'
+                {edc_where}{' AND' if edc_where else ' WHERE'} category_code LIKE '%_alt' AND category_code NOT LIKE '%_alt_two'
+            """
+
+            edc_alt_two_sql = f"""
+                SELECT
+                    'EDC_ALT_TWO' AS dataset,
+                    ticker,
+                    year,
+                    category_code AS item_code,
+                    CASE WHEN is_valid THEN '1' ELSE '0' END AS status,
+                    '' AS extra,
+                    reason,
+                    model,
+                    created_at
+                FROM {edc_table}
+                {edc_where}{' AND' if edc_where else ' WHERE'} category_code LIKE '%_alt_two'
             """
 
             proper_sql = f"""
@@ -6701,6 +6749,13 @@ def page_extract_items():
                     LIMIT ?
                 """
                 params = edc_params + [limit]
+            elif dataset == "edc_alt_two":
+                sql = f"""
+                    {edc_alt_two_sql}
+                    ORDER BY ticker, year DESC, item_code
+                    LIMIT ?
+                """
+                params = edc_params + [limit]
             elif dataset == "proper":
                 sql = f"""
                     {proper_sql}
@@ -6728,6 +6783,8 @@ def page_extract_items():
                     UNION ALL
                     {edc_alt_sql}
                     UNION ALL
+                    {edc_alt_two_sql}
+                    UNION ALL
                     {proper_sql}
                     UNION ALL
                     {gov_sql}
@@ -6736,7 +6793,15 @@ def page_extract_items():
                     ORDER BY ticker, year DESC, dataset, item_code
                     LIMIT ?
                 """
-                params = edc_params + edc_params + proper_params + gov_params + bctc_params + [limit]
+                params = (
+                    edc_params
+                    + edc_params
+                    + edc_params
+                    + proper_params
+                    + gov_params
+                    + bctc_params
+                    + [limit]
+                )
 
             con = get_connection()
             try:

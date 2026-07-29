@@ -5,6 +5,7 @@ from __future__ import annotations
 from config import (
     CHECKLIST_ITEMS,
     CHECKLIST_ITEMS_ALT,
+    CHECKLIST_ITEMS_ALT_TWO,
     GOVERNANCE_EXTRACTION_ITEMS,
     PROPER_VN_ALL_ITEMS,
 )
@@ -17,6 +18,7 @@ GOVERNANCE_ANNUAL_ITEMS: list[dict[str, str]] = [
 ANNUAL_INFERENCE_TASK_ITEMS: dict[str, list[dict[str, str]]] = {
     "edc": CHECKLIST_ITEMS,
     "edc_alt": CHECKLIST_ITEMS_ALT,
+    "edc_alt_two": CHECKLIST_ITEMS_ALT_TWO,
     "proper_vn": PROPER_VN_ALL_ITEMS,
     "governance": GOVERNANCE_ANNUAL_ITEMS,
 }

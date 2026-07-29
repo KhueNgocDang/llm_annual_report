@@ -196,12 +196,46 @@ _CHECKLIST_ALT_DESCRIPTIONS: dict[str, str] = {
 	"ACC2": "Chấp nhận nếu có liên hệ giữa mục tiêu môi trường/ESG và đánh giá hiệu quả, thưởng, KPI quản lý, hoặc cơ chế giám sát điều hành, kể cả gián tiếp.",
 }
 
+# Mid-strict alternatives: stricter than alt, but less strict than original.
+_CHECKLIST_ALT_TWO_DESCRIPTIONS: dict[str, str] = {
+	"CC1": "Chấp nhận nếu nêu rõ ít nhất một rủi ro/cơ hội khí hậu hoặc môi trường quan trọng và có biện pháp quản lý cụ thể hoặc kế hoạch hành động đi kèm.",
+	"CC2": "Chấp nhận nếu có mô tả tác động tài chính/kinh doanh liên quan khí hậu-môi trường kèm ít nhất một chỉ báo định lượng sơ bộ hoặc ví dụ cụ thể theo mảng hoạt động.",
+	"GHG1": "Chấp nhận nếu mô tả cách đo lường phát thải hoặc năng lượng liên quan phát thải và có nêu khung/nguồn dữ liệu hoặc phạm vi áp dụng chính.",
+	"GHG2": "Chấp nhận nếu có thông tin về xác minh/đánh giá bên ngoài và nêu được đơn vị thực hiện hoặc đối tượng/phạm vi dữ liệu được xác minh.",
+	"GHG3": "Chấp nhận nếu công bố ít nhất một số liệu phát thải/GHG/CO2e có đơn vị đo hoặc kỳ báo cáo rõ ràng.",
+	"GHG4": "Chấp nhận nếu có phân tách phát thải theo tối thiểu hai nhóm tương đương phạm vi/nguồn (ví dụ trực tiếp-gián tiếp hoặc điện-nhiên liệu).",
+	"GHG5": "Chấp nhận nếu nêu được các nguồn phát thải chính và có chỉ ra mức độ đóng góp tương đối hoặc ưu tiên quản lý cho từng nguồn.",
+	"GHG6": "Chấp nhận nếu có phân tách phát thải/chỉ số theo đơn vị vận hành (nhà máy, khu vực, mảng kinh doanh...) kèm ít nhất một số liệu hoặc nhận định so sánh.",
+	"GHG7": "Chấp nhận nếu có so sánh theo thời gian tối thiểu 2 kỳ và nêu xu hướng biến động kèm giải thích ngắn gọn nguyên nhân chính.",
+	"EC1": "Chấp nhận nếu công bố tổng tiêu thụ năng lượng và nêu ít nhất một thành phần chính (điện hoặc nhiên liệu) theo cùng kỳ báo cáo.",
+	"EC2": "Chấp nhận nếu có đề cập năng lượng tái tạo kèm mức sử dụng/tỷ trọng hoặc phạm vi áp dụng (nhà máy, văn phòng, dự án...).",
+	"EC3": "Chấp nhận nếu có phân tách tiêu thụ năng lượng theo loại hoặc theo đơn vị vận hành, và có ít nhất một số liệu cụ thể cho từng nhóm chính.",
+	"RC1": "Chấp nhận nếu có kế hoạch/sáng kiến giảm phát thải nêu rõ giải pháp triển khai và mốc thời gian hoặc phạm vi thực hiện.",
+	"RC2": "Chấp nhận nếu có mục tiêu giảm phát thải/môi trường với mức mục tiêu định lượng và ít nhất một mốc thời gian hoặc năm cơ sở.",
+	"RC3": "Chấp nhận nếu có công bố kết quả giảm phát thải/năng lượng đã đạt được kèm số liệu và mốc so sánh trước-sau.",
+	"RC4": "Chấp nhận nếu mô tả việc lồng ghép yếu tố môi trường/phát thải vào quyết định đầu tư hoặc công nghệ, kèm ví dụ quyết định cụ thể hoặc tiêu chí đánh giá.",
+	"ACC1": "Chấp nhận nếu xác định rõ bộ phận/chức danh chịu trách nhiệm và mô tả vai trò giám sát hoặc phê duyệt liên quan môi trường/khí hậu/ESG.",
+	"ACC2": "Chấp nhận nếu có cơ chế liên kết mục tiêu môi trường/ESG với đánh giá hiệu quả hoặc thưởng của quản lý, kèm tiêu chí hoặc cách theo dõi tối thiểu.",
+}
+
 CHECKLIST_ITEMS_ALT: list[dict[str, str]] = [
 	{
 		**item,
 		"code": f"{item['code']}_alt",
 		"item": f"{item['item']} (Alternative)",
 		"description": _CHECKLIST_ALT_DESCRIPTIONS.get(item["code"], item["description"]),
+	}
+	for item in CHECKLIST_ITEMS
+]
+
+CHECKLIST_ITEMS_ALT_TWO: list[dict[str, str]] = [
+	{
+		**item,
+		"code": f"{item['code']}_alt_two",
+		"item": f"{item['item']} (Alternative 2)",
+		"description": _CHECKLIST_ALT_TWO_DESCRIPTIONS.get(
+			item["code"], item["description"]
+		),
 	}
 	for item in CHECKLIST_ITEMS
 ]

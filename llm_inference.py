@@ -445,11 +445,12 @@ def _save_edc_request_inputs(
     prompts: dict[str, str],
 ) -> None:
     """Save exact EDC request inputs sent to OpenAI for audit/debug."""
-    task_type = (
-        "edc_alt"
-        if prompts and all(str(code).endswith("_alt") for code in prompts.keys())
-        else "edc"
-    )
+    if prompts and all(str(code).endswith("_alt_two") for code in prompts.keys()):
+        task_type = "edc_alt_two"
+    elif prompts and all(str(code).endswith("_alt") for code in prompts.keys()):
+        task_type = "edc_alt"
+    else:
+        task_type = "edc"
     rows: list[tuple] = []
     for code, prompt in prompts.items():
         request_body = json.dumps(
