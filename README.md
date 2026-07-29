@@ -20,6 +20,18 @@ uv run python -m main
 
 The app opens on the default NiceGUI local address.
 
+3. Run Phase 2 markdown loading from terminal (optional):
+
+```bash
+uv run python -m load_reports --dataset all --start-year 2015 --end-year 2025
+```
+
+Example with ticker filter:
+
+```bash
+uv run python -m load_reports --dataset financial_statement --tickers "CAG, VOS" --start-year 2020 --end-year 2025
+```
+
 ## Full Stack Dependencies
 
 For OCR and advanced pipeline phases, install optional heavy dependencies:
