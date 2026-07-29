@@ -18,6 +18,10 @@ from financial_data import (
     sync_financial_ratios_all,
     sync_financial_statements_all,
 )
+from report_loader import (
+    load_annual_reports_from_markdown,
+    load_financial_statement_reports_from_markdown,
+)
 from vietstock_documents import (
     download_all_unsynced,
     sync_documents_for_all_companies,
@@ -38,9 +42,13 @@ def _stats_text() -> str:
             company_count = con.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
             doc_count = con.execute("SELECT COUNT(*) FROM vietstock_documents").fetchone()[0]
             report_count = con.execute("SELECT COUNT(*) FROM annual_reports").fetchone()[0]
+            financial_statement_count = con.execute(
+                "SELECT COUNT(*) FROM financial_statement_reports"
+            ).fetchone()[0]
             return (
                 f"companies={company_count} | documents={doc_count} | "
-                f"annual_reports={report_count}"
+                f"annual_reports={report_count} | "
+                f"financial_statement_reports={financial_statement_count}"
             )
     except Exception as exc:
         return f"Database not ready: {exc}"
@@ -141,6 +149,48 @@ def _sync_docs_all_now(stats: ui.label, doc_type: str) -> None:
             f"tickers_ok={result['tickers_done']} failed={result['tickers_failed']}"
         ),
         type="positive" if result["tickers_failed"] == 0 else "warning",
+    )
+
+
+def _parse_ticker_filter(raw_text: str) -> list[str] | None:
+    tickers = [token.strip().upper() for token in raw_text.replace(",", " ").split() if token.strip()]
+    return tickers or None
+
+
+def _load_annual_now(stats: ui.label, ticker_filter: str, start_year: int, end_year: int) -> None:
+    result = load_annual_reports_from_markdown(
+        tickers=_parse_ticker_filter(ticker_filter),
+        start_year=start_year,
+        end_year=end_year,
+    )
+    stats.set_text(_stats_text())
+    ui.notify(
+        (
+            f"Annual load: loaded={result['loaded']} pairs={result['pairs']} "
+            f"failed={result['failed']} skipped={result['skipped']} filtered={result['filtered_out']}"
+        ),
+        type="positive" if result["failed"] == 0 else "warning",
+    )
+
+
+def _load_financial_statement_now(
+    stats: ui.label,
+    ticker_filter: str,
+    start_year: int,
+    end_year: int,
+) -> None:
+    result = load_financial_statement_reports_from_markdown(
+        tickers=_parse_ticker_filter(ticker_filter),
+        start_year=start_year,
+        end_year=end_year,
+    )
+    stats.set_text(_stats_text())
+    ui.notify(
+        (
+            f"Financial statement load: loaded={result['loaded']} pairs={result['pairs']} "
+            f"failed={result['failed']} skipped={result['skipped']} filtered={result['filtered_out']}"
+        ),
+        type="positive" if result["failed"] == 0 else "warning",
     )
 
 
@@ -267,6 +317,37 @@ def build_ui() -> None:
                 ui.button(
                     "Download Unsynced",
                     on_click=lambda: _download_unsynced_now(stats, bool(use_llm.value)),
+                )
+
+        with ui.card().classes("w-full"):
+            ui.label("Phase 2 - Markdown Loading MVP").classes("text-lg font-semibold")
+            ui.label(
+                "Load converted markdown from disk into annual_reports and financial_statement_reports with idempotent upserts."
+            ).classes("text-sm text-gray-600")
+
+            with ui.row().classes("w-full gap-2"):
+                loader_tickers = ui.input("Tickers filter (optional)").classes("w-72")
+                loader_start_year = ui.number("Start Year", value=DEFAULT_START_YEAR, step=1).classes("w-40")
+                loader_end_year = ui.number("End Year", value=DEFAULT_END_YEAR, step=1).classes("w-40")
+
+            with ui.row().classes("gap-2"):
+                ui.button(
+                    "Load Annual Markdown",
+                    on_click=lambda: _load_annual_now(
+                        stats,
+                        ticker_filter=str(loader_tickers.value or ""),
+                        start_year=int(loader_start_year.value or DEFAULT_START_YEAR),
+                        end_year=int(loader_end_year.value or DEFAULT_END_YEAR),
+                    ),
+                )
+                ui.button(
+                    "Load Financial Statement Markdown",
+                    on_click=lambda: _load_financial_statement_now(
+                        stats,
+                        ticker_filter=str(loader_tickers.value or ""),
+                        start_year=int(loader_start_year.value or DEFAULT_START_YEAR),
+                        end_year=int(loader_end_year.value or DEFAULT_END_YEAR),
+                    ),
                 )
 
 

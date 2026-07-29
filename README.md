@@ -49,3 +49,11 @@ uv sync --extra full
     - RAR extraction fallback (rarfile/unrar/bsdtar)
     - optional LLM-assisted candidate selection
     - persisted selection method/reason and sync errors
+
+- Phase 2 conversion/loading MVP is now available:
+  - Markdown corpus loader for annual reports and financial statement reports
+  - Idempotent upserts into `annual_reports` and `financial_statement_reports`
+  - Lineage tracking in `pipeline_files` with stage keys:
+    - `markdown_annual`
+    - `markdown_financial_statement`
+  - Ticker/year scoped loads from UI controls
