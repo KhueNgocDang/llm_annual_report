@@ -69,3 +69,8 @@ uv sync --extra full
     - `markdown_annual`
     - `markdown_financial_statement`
   - Ticker/year scoped loads from UI controls
+
+- Simple output visualization is available in UI:
+  - Dataset/ticker/year output filtering
+  - Table view with source file and content preview
+  - Selected row full-content preview panel

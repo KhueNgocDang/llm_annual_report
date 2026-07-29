@@ -194,6 +194,105 @@ def _load_financial_statement_now(
     )
 
 
+def _parse_year(raw_text: str) -> int | None:
+    text = raw_text.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _query_output_rows(
+    dataset: str,
+    ticker_filter: str,
+    year_filter: int | None,
+    limit: int,
+) -> list[dict[str, str]]:
+    ticker = ticker_filter.strip().upper()
+
+    if dataset == "all":
+        sql = """
+            SELECT dataset, ticker, year, source_file, content
+            FROM (
+                SELECT 'annual' AS dataset, ticker, year, source_file, content
+                FROM annual_reports
+                UNION ALL
+                SELECT 'financial_statement' AS dataset, ticker, year, source_file, content
+                FROM financial_statement_reports
+            ) q
+            WHERE (? = '' OR ticker = ?)
+              AND (? IS NULL OR year = ?)
+            ORDER BY year DESC, ticker
+            LIMIT ?
+        """
+        params: list[object] = [ticker, ticker, year_filter, year_filter, limit]
+    else:
+        table = "annual_reports" if dataset == "annual" else "financial_statement_reports"
+        sql = f"""
+            SELECT ? AS dataset, ticker, year, source_file, content
+            FROM {table}
+            WHERE (? = '' OR ticker = ?)
+              AND (? IS NULL OR year = ?)
+            ORDER BY year DESC, ticker
+            LIMIT ?
+        """
+        params = [dataset, ticker, ticker, year_filter, year_filter, limit]
+
+    with connection_scope() as con:
+        rows = con.execute(sql, params).fetchall()
+
+    out: list[dict[str, str]] = []
+    for r in rows:
+        full_content = str(r[4] or "")
+        out.append(
+            {
+                "dataset": str(r[0]),
+                "ticker": str(r[1]),
+                "year": str(r[2]),
+                "source_file": str(r[3]),
+                "preview": full_content[:280].replace("\n", " "),
+                "full_content": full_content,
+            }
+        )
+    return out
+
+
+def _load_outputs_now(
+    table: ui.table,
+    dataset: str,
+    ticker_filter: str,
+    year_text: str,
+    limit: int,
+) -> None:
+    year_filter = _parse_year(year_text)
+    if year_text.strip() and year_filter is None:
+        ui.notify("Year filter must be a number", type="warning")
+        return
+
+    rows = _query_output_rows(
+        dataset=dataset,
+        ticker_filter=ticker_filter,
+        year_filter=year_filter,
+        limit=max(1, min(limit, 1000)),
+    )
+    table.rows = rows
+    table.selected = []
+    table.update()
+    ui.notify(f"Loaded {len(rows)} output rows", type="positive")
+
+
+def _show_selected_output(table: ui.table, preview_area: ui.textarea) -> None:
+    selected = table.selected or []
+    if not selected:
+        ui.notify("Select one output row first", type="warning")
+        return
+    row = selected[0]
+    preview_area.value = str(row.get("full_content") or "")
+    preview_area.update()
+
+
 def build_ui() -> None:
     ui.page_title("Annual Report Intelligence Platform")
 
@@ -348,6 +447,56 @@ def build_ui() -> None:
                         start_year=int(loader_start_year.value or DEFAULT_START_YEAR),
                         end_year=int(loader_end_year.value or DEFAULT_END_YEAR),
                     ),
+                )
+
+        with ui.card().classes("w-full"):
+            ui.label("Simple Output Browser").classes("text-lg font-semibold")
+            ui.label(
+                "Browse loaded annual and financial statement outputs by filter, then preview selected content."
+            ).classes("text-sm text-gray-600")
+
+            with ui.row().classes("w-full gap-2 items-end"):
+                dataset_select = ui.select(
+                    options={
+                        "all": "All",
+                        "annual": "Annual",
+                        "financial_statement": "Financial Statement",
+                    },
+                    value="all",
+                    label="Dataset",
+                ).classes("w-52")
+                output_ticker = ui.input("Ticker (optional)").classes("w-40")
+                output_year = ui.input("Year (optional)").classes("w-40")
+                output_limit = ui.number("Limit", value=50, step=1).classes("w-32")
+
+            output_table = ui.table(
+                columns=[
+                    {"name": "dataset", "label": "Dataset", "field": "dataset", "align": "left"},
+                    {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
+                    {"name": "year", "label": "Year", "field": "year", "align": "left"},
+                    {"name": "source_file", "label": "Source File", "field": "source_file", "align": "left"},
+                    {"name": "preview", "label": "Preview", "field": "preview", "align": "left"},
+                ],
+                rows=[],
+                row_key="source_file",
+            ).classes("w-full")
+            output_table.props("selection=single")
+
+            with ui.row().classes("gap-2"):
+                ui.button(
+                    "Load Outputs",
+                    on_click=lambda: _load_outputs_now(
+                        output_table,
+                        dataset=str(dataset_select.value or "all"),
+                        ticker_filter=str(output_ticker.value or ""),
+                        year_text=str(output_year.value or ""),
+                        limit=int(output_limit.value or 50),
+                    ),
+                )
+                output_preview = ui.textarea("Selected Content").props("readonly autogrow").classes("w-full")
+                ui.button(
+                    "Preview Selected",
+                    on_click=lambda: _show_selected_output(output_table, output_preview),
                 )
 
 
