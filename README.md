@@ -20,6 +20,14 @@ uv run python -m main
 
 The app opens on the default NiceGUI local address.
 
+2. Start the Dash frontend:
+
+```bash
+uv run python -m dash_app
+```
+
+Open http://127.0.0.1:8050 to use the task runner and output explorer dashboard.
+
 3. Run Phase 2 markdown loading from terminal (optional):
 
 ```bash
@@ -74,3 +82,7 @@ uv sync --extra full
   - Dataset/ticker/year output filtering
   - Table view with source file and content preview
   - Selected row full-content preview panel
+
+- Dash frontend is available for operations + visualization:
+  - Task Runner tab to execute pipeline actions
+  - Output Explorer tab with table and charts (by year, top tickers)
