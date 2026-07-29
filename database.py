@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS annual_reports (
     PRIMARY KEY (ticker, year)
 );
 
-CREATE TABLE IF NOT EXISTS bctc_reports (
+CREATE TABLE IF NOT EXISTS financial_statement_reports (
     ticker VARCHAR NOT NULL,
     year INTEGER NOT NULL,
     content VARCHAR NOT NULL,
@@ -162,6 +162,37 @@ def _apply_schema_backfills(con: duckdb.DuckDBPyConnection) -> None:
     )
     con.execute(
         "ALTER TABLE vietstock_documents ADD COLUMN IF NOT EXISTS last_downloaded_at TIMESTAMP"
+    )
+    _backfill_financial_statement_reports(con)
+
+
+def _table_exists(con: duckdb.DuckDBPyConnection, table_name: str) -> bool:
+    return bool(
+        con.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'main' AND table_name = ?
+            """,
+            [table_name],
+        ).fetchone()[0]
+    )
+
+
+def _backfill_financial_statement_reports(con: duckdb.DuckDBPyConnection) -> None:
+    """Migrate legacy bctc reports into financial statement table if needed."""
+    if not _table_exists(con, "bctc_reports"):
+        return
+    con.execute(
+        """
+        INSERT INTO financial_statement_reports (ticker, year, content, source_file, created_at)
+        SELECT ticker, year, content, source_file, created_at
+        FROM bctc_reports
+        ON CONFLICT (ticker, year) DO UPDATE SET
+            content = EXCLUDED.content,
+            source_file = EXCLUDED.source_file,
+            created_at = EXCLUDED.created_at
+        """
     )
 
 

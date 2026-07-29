@@ -21,7 +21,8 @@ RAW_DIR = DATA_DIR / "raw"
 STAGING_DIR = DATA_DIR / "staging"
 OUTPUT_DIR = DATA_DIR / "output"
 MARKDOWN_DIR = DATA_DIR / "markdown"
-BCTC_MARKDOWN_DIR = DATA_DIR / "markdown_bctc"
+FINANCIAL_STATEMENT_MARKDOWN_DIR = DATA_DIR / "markdown_bctc"
+BCTC_MARKDOWN_DIR = FINANCIAL_STATEMENT_MARKDOWN_DIR
 LOGS_DIR = DATA_DIR / "logs"
 
 DB_PATH = BASE_DIR / os.getenv("DB_PATH", "db.db")
@@ -55,7 +56,7 @@ def bootstrap_directories() -> list[Path]:
         STAGING_DIR,
         OUTPUT_DIR,
         MARKDOWN_DIR,
-        BCTC_MARKDOWN_DIR,
+        FINANCIAL_STATEMENT_MARKDOWN_DIR,
         LOGS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
