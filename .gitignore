@@ -10,7 +10,7 @@ wheels/
 .venv
 .env
 # Project data
-db.db
+*.db
 db.db.wal
 data/
 token.json
