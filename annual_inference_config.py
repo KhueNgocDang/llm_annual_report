@@ -10,7 +10,7 @@ from config import (
     PROPER_VN_ALL_ITEMS,
 )
 
-# GOV_AUDIT belongs to BCTC/financial-statement extraction, not annual reports.
+# GOV_AUDIT belongs to financial-statement extraction, not annual reports.
 GOVERNANCE_ANNUAL_ITEMS: list[dict[str, str]] = [
     item for item in GOVERNANCE_EXTRACTION_ITEMS if item.get("code") != "GOV_AUDIT"
 ]

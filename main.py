@@ -15,11 +15,11 @@ from nicegui import ui
 
 from annual_inference_config import get_task_items
 from config import (
-    BCTC_MARKDOWN_DIR,
     DEFAULT_END_YEAR,
     DEFAULT_START_YEAR,
     EMBEDDING_CHUNK_SIZE,
     EMBEDDING_MODEL,
+    FINANCIAL_STATEMENT_MARKDOWN_DIR,
     INFERENCE_MODEL,
     INFERENCE_TOP_K,
     MARKDOWN_DIR,
@@ -68,15 +68,15 @@ class ProcessingStatusRow(TypedDict):
     ticker: str
     year: int
     annual_emb_chunks: int
-    bctc_emb_chunks: int
+    financial_statement_emb_chunks: int
     annual_embedded: bool
-    bctc_embedded: bool
+    financial_statement_embedded: bool
     has_annual: bool
-    has_bctc: bool
+    has_financial_statement: bool
     edc_done: bool
     proper_done: bool
     gov_done: bool
-    bctc_audit_done: bool
+    financial_statement_audit_done: bool
 
 
 class TargetStatusRow(TypedDict):
@@ -751,7 +751,7 @@ def _make_load(
     return run
 
 
-def _make_convert_bctc(
+def _make_convert_financial_statement(
     state: TaskState,
     refresh: Callable,
     *,
@@ -761,7 +761,7 @@ def _make_convert_bctc(
     force: Callable[[], bool] = lambda: False,
 ) -> Callable:
     def run():
-        from converter import convert_bctc_to_markdown
+        from converter import convert_financial_statement_to_markdown
 
         con = get_connection()
         try:
@@ -797,23 +797,23 @@ def _make_convert_bctc(
 
             candidates = con.execute(sql, params).fetchall()
             if not candidates:
-                state.summary = "No BCTC reports to convert for selected filters"
+                state.summary = "No financial statements to convert for selected filters"
                 return
 
             completed = 0
             failed = 0
             for ticker, year in candidates:
                 try:
-                    convert_bctc_to_markdown(
+                    convert_financial_statement_to_markdown(
                         con,
                         ticker=str(ticker),
                         year=int(year),
-                        output_dir=BCTC_MARKDOWN_DIR,
+                        output_dir=FINANCIAL_STATEMENT_MARKDOWN_DIR,
                     )
                     completed += 1
                     state.rows.append(
                         TaskRow(
-                            label=f"[BCTC] {ticker} {int(year)}",
+                            label=f"[FINANCIAL_STATEMENT] {ticker} {int(year)}",
                             detail="converted",
                             status="done",
                         )
@@ -822,7 +822,7 @@ def _make_convert_bctc(
                     failed += 1
                     state.rows.append(
                         TaskRow(
-                            label=f"[BCTC] {ticker} {int(year)}",
+                            label=f"[FINANCIAL_STATEMENT] {ticker} {int(year)}",
                             detail=str(exc)[:100],
                             status="error",
                         )
@@ -830,7 +830,7 @@ def _make_convert_bctc(
                 refresh()
 
             state.summary = (
-                f"✅ BCTC: {completed} converted, {failed} failed "
+                f"✅ Financial statements: {completed} converted, {failed} failed "
                 f"(of {len(candidates)} total)"
             )
         finally:
@@ -1240,13 +1240,13 @@ _PIPELINE_JOBS = [
     ("ratios", "4. Sync Financial Ratios"),
     ("listings_annual", "5. Sync Annual Report Listings"),
     (
-        "listings_bctc",
-        "6. Sync BCTC Listings (Audited Consolidated Financial Statements)",
+        "listings_financial_statement",
+        "6. Sync Financial Statement Listings (Audited Consolidated Financial Statements)",
     ),
     ("download_annual", "7. Download Annual Report PDFs"),
-    ("download_bctc", "8. Download BCTC PDFs"),
+    ("download_financial_statement", "8. Download Financial Statement PDFs"),
     ("convert", "9. Convert Annual Reports to Markdown"),
-    ("convert_bctc", "10. Convert BCTC to Markdown"),
+    ("convert_financial_statement", "10. Convert Financial Statements to Markdown"),
     ("load", "11. Load Markdown to DB"),
     ("embed", "12. Embed Annual Reports"),
     ("infer_edc", "13. Infer EDC"),
@@ -1494,7 +1494,7 @@ def _page_home_content():
                 ui.button("Run Pipeline", on_click=_go_pipeline).props(
                     "outline"
                 ).tooltip(
-                    "Statements, ratios, annual listings/download, BCTC listings/download, convert, load"
+                    "Statements, ratios, annual listings/download, financial-statement listings/download, convert, load"
                 )
 
         # --- Quick stats ---
@@ -2756,7 +2756,7 @@ def page_jobs(
                 ticker_filter=get_tickers,
                 force=get_force,
             ),
-            "listings_bctc": lambda s, r: _make_sync_listings(
+            "listings_financial_statement": lambda s, r: _make_sync_listings(
                 s,
                 get_sy,
                 get_ey,
@@ -2779,7 +2779,7 @@ def page_jobs(
                 ticker_filter=get_tickers,
                 force=get_force,
             ),
-            "download_bctc": lambda s, r: _make_download_pdfs(
+            "download_financial_statement": lambda s, r: _make_download_pdfs(
                 s,
                 r,
                 doc_type=lambda: DOC_TYPE_AUDITED_CONSOLIDATED_FS,
@@ -2797,7 +2797,7 @@ def page_jobs(
                 job_scope_label=lambda: "Annual Reports",
                 force=get_force,
             ),
-            "convert_bctc": lambda s, r: _make_convert_bctc(
+            "convert_financial_statement": lambda s, r: _make_convert_financial_statement(
                 s,
                 r,
                 start_year=get_sy,
@@ -2919,7 +2919,7 @@ def page_job_matrix():
     _nav_header()
     init_db()
 
-    from converter import convert_bctc_to_markdown, create_jobs, run_job
+    from converter import convert_financial_statement_to_markdown, create_jobs, run_job
     from llm_embeddings import embed_report
     from llm_governance import extract_governance
     from llm_inference import infer_report
@@ -2987,11 +2987,11 @@ def page_job_matrix():
 
         job_options = {
             "listings_annual": "Sync Annual Listings",
-            "listings_bctc": "Sync BCTC Listings",
+            "listings_financial_statement": "Sync Financial Statement Listings",
             "download_annual": "Download Annual PDFs",
-            "download_bctc": "Download BCTC PDFs",
+            "download_financial_statement": "Download Financial Statement PDFs",
             "convert": "Convert to Markdown",
-            "convert_bctc": "Convert BCTC to Markdown",
+            "convert_financial_statement": "Convert Financial Statements to Markdown",
             "load": "Load Markdown",
             "embed": "Embed",
             "infer_edc": "Infer EDC",
@@ -3100,7 +3100,7 @@ def page_job_matrix():
                             WHERE vd.ticker = u.ticker
                               AND vd.doc_type = '1'
                               AND TRY_CAST(regexp_extract(vd.title, '(\\d{{4}})', 1) AS INTEGER) = u.year
-                        ) AS bctc_listed,
+                                                ) AS financial_statement_listed,
                         EXISTS (
                             SELECT 1 FROM vietstock_documents vd
                             WHERE vd.ticker = u.ticker
@@ -3114,7 +3114,7 @@ def page_job_matrix():
                               AND vd.doc_type = '1'
                               AND vd.synced_to_raw = TRUE
                               AND TRY_CAST(regexp_extract(vd.title, '(\\d{{4}})', 1) AS INTEGER) = u.year
-                        ) AS bctc_downloaded,
+                                                ) AS financial_statement_downloaded,
                         EXISTS (
                             SELECT 1 FROM conversion_jobs cj
                             WHERE cj.ticker = u.ticker
@@ -3178,9 +3178,9 @@ def page_job_matrix():
                     "ticker": ticker,
                     "year": year,
                     "annual_listed": _ok(annual_listed),
-                    "bctc_listed": _ok(bctc_listed),
+                    "financial_statement_listed": _ok(financial_statement_listed),
                     "annual_downloaded": _ok(annual_downloaded),
-                    "bctc_downloaded": _ok(bctc_downloaded),
+                    "financial_statement_downloaded": _ok(financial_statement_downloaded),
                     "converted": _ok(converted),
                     "loaded": _ok(loaded),
                     "embedded": _ok(embedded),
@@ -3192,9 +3192,9 @@ def page_job_matrix():
                     ticker,
                     year,
                     annual_listed,
-                    bctc_listed,
+                    financial_statement_listed,
                     annual_downloaded,
-                    bctc_downloaded,
+                    financial_statement_downloaded,
                     converted,
                     loaded,
                     embedded,
@@ -3208,9 +3208,9 @@ def page_job_matrix():
                 {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
                 {"name": "year", "label": "Year", "field": "year", "align": "center"},
                 {"name": "annual_listed", "label": "Annual Report Listed", "field": "annual_listed", "align": "center"},
-                {"name": "bctc_listed", "label": "Annual Financial Statement", "field": "bctc_listed", "align": "center"},
+                {"name": "financial_statement_listed", "label": "Financial Statement Listed", "field": "financial_statement_listed", "align": "center"},
                 {"name": "annual_downloaded", "label": "Annual Downloaded", "field": "annual_downloaded", "align": "center"},
-                {"name": "bctc_downloaded", "label": "BCTC Downloaded", "field": "bctc_downloaded", "align": "center"},
+                {"name": "financial_statement_downloaded", "label": "Financial Statement Downloaded", "field": "financial_statement_downloaded", "align": "center"},
                 {"name": "converted", "label": "Converted", "field": "converted", "align": "center"},
                 {"name": "loaded", "label": "Loaded", "field": "loaded", "align": "center"},
                 {"name": "embedded", "label": "Embedded", "field": "embedded", "align": "center"},
@@ -3310,7 +3310,7 @@ def page_job_matrix():
                                             start_year=year,
                                             end_year=year,
                                         )
-                                    elif job_key == "listings_bctc":
+                                    elif job_key == "listings_financial_statement":
                                         fetch_all_companies_documents(
                                             con,
                                             doc_type=DOC_TYPE_AUDITED_CONSOLIDATED_FS,
@@ -3318,7 +3318,7 @@ def page_job_matrix():
                                             start_year=year,
                                             end_year=year,
                                         )
-                                    elif job_key in {"download_annual", "download_bctc"}:
+                                    elif job_key in {"download_annual", "download_financial_statement"}:
                                         doc_type = (
                                             DOC_TYPE_ANNUAL_REPORT
                                             if job_key == "download_annual"
@@ -3376,8 +3376,8 @@ def page_job_matrix():
                                             ok = run_job(con, int(job_id))
                                             if not ok:
                                                 raise RuntimeError("conversion failed")
-                                    elif job_key == "convert_bctc":
-                                        convert_bctc_to_markdown(
+                                    elif job_key == "convert_financial_statement":
+                                        convert_financial_statement_to_markdown(
                                             con,
                                             ticker,
                                             year,
@@ -3519,7 +3519,7 @@ def page_llm_tasks():
         EDC_TOTAL = 18
         PROPER_TOTAL = 7
         GOV_TOTAL = 4
-        BCTC_AUDIT_TOTAL = 1
+        FINANCIAL_STATEMENT_AUDIT_TOTAL = 1
         GOVERNANCE_ANNUAL_ITEM_CODES = [
             "GOV_SHAREHOLDERS",
             "GOV_DIRECTORY",
@@ -3643,11 +3643,11 @@ def page_llm_tasks():
                             "all": "All reports",
                             "any_unprocessed": "Any unprocessed stage",
                             "needs_embedding": "Need embedding",
-                            "needs_bctc_embedding": "Need BCTC embedding",
+                            "needs_financial_statement_embedding": "Need financial-statement embedding",
                             "needs_edc": "Need EDC",
                             "needs_proper": "Need PROPER-VN",
                             "needs_governance": "Need governance",
-                            "needs_bctc_audit": "Need BCTC audit extraction",
+                            "needs_financial_statement_audit": "Need financial-statement audit extraction",
                             "fully_processed": "Fully processed",
                         },
                         value="all",
@@ -3700,8 +3700,8 @@ def page_llm_tasks():
                                 label="Embedding target",
                                 options={
                                     "annual": "Annual reports",
-                                    "bctc": "BCTC reports",
-                                    "both": "Both annual + BCTC",
+                                    "financial_statement": "Financial statements",
+                                    "both": "Both annual + financial statement",
                                 },
                                 value="annual",
                             )
@@ -3889,7 +3889,7 @@ def page_llm_tasks():
                 WITH base AS (
                     SELECT ticker, year FROM annual_reports
                     UNION
-                    SELECT ticker, year FROM bctc_reports
+                    SELECT ticker, year FROM financial_statement_reports
                 ),
                 emb AS (
                     SELECT ticker, year, COUNT(*) AS c
@@ -3897,9 +3897,9 @@ def page_llm_tasks():
                     WHERE model = ?
                     GROUP BY ALL
                 ),
-                bctc_emb AS (
+                financial_statement_emb AS (
                     SELECT ticker, year, COUNT(*) AS c
-                    FROM bctc_document_embeddings
+                    FROM financial_statement_document_embeddings
                     WHERE model = ?
                     GROUP BY ALL
                 ),
@@ -3921,9 +3921,9 @@ def page_llm_tasks():
                     WHERE model = ? AND item_code != 'GOV_AUDIT'
                     GROUP BY ALL
                 ),
-                bctc_audit AS (
+                financial_statement_audit AS (
                     SELECT ticker, year, COUNT(*) AS c
-                    FROM bctc_audit_results
+                    FROM financial_statement_audit_results
                     WHERE model = ?
                     GROUP BY ALL
                 )
@@ -3931,26 +3931,26 @@ def page_llm_tasks():
                     b.ticker,
                     b.year,
                     COALESCE(emb.c, 0) AS annual_emb_chunks,
-                    COALESCE(bctc_emb.c, 0) AS bctc_emb_chunks,
+                    COALESCE(financial_statement_emb.c, 0) AS financial_statement_emb_chunks,
                     EXISTS (
                         SELECT 1 FROM annual_reports ar
                         WHERE ar.ticker = b.ticker AND ar.year = b.year
                     ) AS has_annual,
                     EXISTS (
-                        SELECT 1 FROM bctc_reports br
+                        SELECT 1 FROM financial_statement_reports br
                         WHERE br.ticker = b.ticker AND br.year = b.year
-                    ) AS has_bctc,
+                    ) AS has_financial_statement,
                     COALESCE(edc.c, 0) AS edc_count,
                     COALESCE(proper.c, 0) AS proper_count,
                     COALESCE(gov.c, 0) AS gov_count,
-                    COALESCE(bctc_audit.c, 0) AS bctc_audit_count
+                    COALESCE(financial_statement_audit.c, 0) AS financial_statement_audit_count
                 FROM base b
                 LEFT JOIN emb ON emb.ticker = b.ticker AND emb.year = b.year
-                LEFT JOIN bctc_emb ON bctc_emb.ticker = b.ticker AND bctc_emb.year = b.year
+                LEFT JOIN financial_statement_emb ON financial_statement_emb.ticker = b.ticker AND financial_statement_emb.year = b.year
                 LEFT JOIN edc ON edc.ticker = b.ticker AND edc.year = b.year
                 LEFT JOIN proper ON proper.ticker = b.ticker AND proper.year = b.year
                 LEFT JOIN gov ON gov.ticker = b.ticker AND gov.year = b.year
-                LEFT JOIN bctc_audit ON bctc_audit.ticker = b.ticker AND bctc_audit.year = b.year
+                LEFT JOIN financial_statement_audit ON financial_statement_audit.ticker = b.ticker AND financial_statement_audit.year = b.year
                 ORDER BY b.ticker, b.year
                 """,
                 [
@@ -3968,54 +3968,58 @@ def page_llm_tasks():
                     "ticker": r[0],
                     "year": int(r[1]),
                     "annual_emb_chunks": int(r[2]),
-                    "bctc_emb_chunks": int(r[3]),
+                    "financial_statement_emb_chunks": int(r[3]),
                     "annual_embedded": int(r[2]) > 0,
-                    "bctc_embedded": int(r[3]) > 0,
+                    "financial_statement_embedded": int(r[3]) > 0,
                     "has_annual": bool(r[4]),
-                    "has_bctc": bool(r[5]),
+                    "has_financial_statement": bool(r[5]),
                     "edc_done": int(r[6]) >= EDC_TOTAL,
                     "proper_done": int(r[7]) >= PROPER_TOTAL,
                     "gov_done": int(r[8]) >= GOV_TOTAL,
-                    "bctc_audit_done": int(r[9]) >= BCTC_AUDIT_TOTAL,
+                    "financial_statement_audit_done": int(r[9]) >= FINANCIAL_STATEMENT_AUDIT_TOTAL,
                 }
                 for r in rows
             ]
 
         def _row_matches_scope(row: ProcessingStatusRow, scope: str) -> bool:
             annual_embedded = bool(row["annual_embedded"])
-            bctc_embedded = bool(row["bctc_embedded"])
+            financial_statement_embedded = bool(row["financial_statement_embedded"])
             has_annual = bool(row["has_annual"])
-            has_bctc = bool(row["has_bctc"])
+            has_financial_statement = bool(row["has_financial_statement"])
             edc_done = bool(row["edc_done"])
             proper_done = bool(row["proper_done"])
             gov_done = bool(row["gov_done"])
-            bctc_audit_done = bool(row["bctc_audit_done"])
+            financial_statement_audit_done = bool(row["financial_statement_audit_done"])
             if scope == "all":
                 return True
             if scope == "needs_embedding":
                 return has_annual and not annual_embedded
-            if scope == "needs_bctc_embedding":
-                return has_bctc and not bctc_embedded
+            if scope == "needs_financial_statement_embedding":
+                return has_financial_statement and not financial_statement_embedded
             if scope == "needs_edc":
                 return has_annual and annual_embedded and not edc_done
             if scope == "needs_proper":
                 return has_annual and annual_embedded and not proper_done
             if scope == "needs_governance":
                 return has_annual and annual_embedded and not gov_done
-            if scope == "needs_bctc_audit":
-                return has_bctc and bctc_embedded and not bctc_audit_done
+            if scope == "needs_financial_statement_audit":
+                return has_financial_statement and financial_statement_embedded and not financial_statement_audit_done
             if scope == "fully_processed":
                 annual_ok = (not has_annual) or (
                     annual_embedded and edc_done and proper_done and gov_done
                 )
-                bctc_ok = (not has_bctc) or (bctc_embedded and bctc_audit_done)
-                return annual_ok and bctc_ok
+                financial_statement_ok = (not has_financial_statement) or (
+                    financial_statement_embedded and financial_statement_audit_done
+                )
+                return annual_ok and financial_statement_ok
             if scope == "any_unprocessed":
                 annual_ok = (not has_annual) or (
                     annual_embedded and edc_done and proper_done and gov_done
                 )
-                bctc_ok = (not has_bctc) or (bctc_embedded and bctc_audit_done)
-                return not (annual_ok and bctc_ok)
+                financial_statement_ok = (not has_financial_statement) or (
+                    financial_statement_embedded and financial_statement_audit_done
+                )
+                return not (annual_ok and financial_statement_ok)
             return True
 
         def _target_pairs(con) -> list[tuple[str, int]]:
@@ -4037,18 +4041,18 @@ def page_llm_tasks():
             ).fetchall()
             return [(str(r[0]), int(r[1])) for r in rows]
 
-        def _all_bctc_pairs(con) -> list[tuple[str, int]]:
+        def _all_financial_statement_pairs(con) -> list[tuple[str, int]]:
             rows = con.execute(
-                "SELECT DISTINCT ticker, year FROM bctc_reports ORDER BY ticker, year"
+                "SELECT DISTINCT ticker, year FROM financial_statement_reports ORDER BY ticker, year"
             ).fetchall()
             return [(str(r[0]), int(r[1])) for r in rows]
 
-        def _target_bctc_pairs(con) -> list[tuple[str, int]]:
+        def _target_financial_statement_pairs(con) -> list[tuple[str, int]]:
             rows = _processing_rows(con)
             selected_tickers = _selected_tickers()
             years = set(_selected_years())
             scope = _selected_scope()
-            filtered = [r for r in rows if bool(r["has_bctc"])]
+            filtered = [r for r in rows if bool(r["has_financial_statement"])]
             if selected_tickers:
                 tset = {t.upper() for t in selected_tickers}
                 filtered = [r for r in filtered if r["ticker"] in tset]
@@ -4061,7 +4065,7 @@ def page_llm_tasks():
         infer_edc_state = TaskState()
         infer_proper_state = TaskState()
         infer_gov_state = TaskState()
-        infer_bctc_audit_state = TaskState()
+        infer_financial_statement_audit_state = TaskState()
 
         def _filtered_processing_rows() -> list[ProcessingStatusRow]:
             con = get_connection()
@@ -4122,15 +4126,15 @@ def page_llm_tasks():
                                 "align": "center",
                             },
                             {
-                                "name": "bctc_chunks",
-                                "label": "BCTC Chunks",
-                                "field": "bctc_chunks",
+                                "name": "financial_statement_chunks",
+                                "label": "Financial Statement Chunks",
+                                "field": "financial_statement_chunks",
                                 "align": "right",
                             },
                             {
-                                "name": "bctc_embedded",
-                                "label": "BCTC Embedded",
-                                "field": "bctc_embedded",
+                                "name": "financial_statement_embedded",
+                                "label": "Financial Statement Embedded",
+                                "field": "financial_statement_embedded",
                                 "align": "center",
                             },
                         ],
@@ -4140,8 +4144,8 @@ def page_llm_tasks():
                                 "year": r["year"],
                                 "annual_chunks": r["annual_emb_chunks"],
                                 "annual_embedded": "✅" if r["annual_embedded"] else "⬜",
-                                "bctc_chunks": r["bctc_emb_chunks"],
-                                "bctc_embedded": "✅" if r["bctc_embedded"] else "⬜",
+                                "financial_statement_chunks": r["financial_statement_emb_chunks"],
+                                "financial_statement_embedded": "✅" if r["financial_statement_embedded"] else "⬜",
                             }
                             for r in rows
                         ],
@@ -4172,22 +4176,22 @@ def page_llm_tasks():
                             {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
                             {"name": "year", "label": "Year", "field": "year", "align": "center"},
                             {"name": "annual_embed", "label": "Annual Embed", "field": "annual_embed", "align": "center"},
-                            {"name": "bctc_embed", "label": "BCTC Embed", "field": "bctc_embed", "align": "center"},
+                            {"name": "financial_statement_embed", "label": "Financial Statement Embed", "field": "financial_statement_embed", "align": "center"},
                             {"name": "edc", "label": "EDC", "field": "edc", "align": "center"},
                             {"name": "proper", "label": "PROPER", "field": "proper", "align": "center"},
                             {"name": "gov", "label": "Governance", "field": "gov", "align": "center"},
-                            {"name": "bctc_audit", "label": "BCTC Audit", "field": "bctc_audit", "align": "center"},
+                            {"name": "financial_statement_audit", "label": "Financial Statement Audit", "field": "financial_statement_audit", "align": "center"},
                         ],
                         rows=[
                             {
                                 "ticker": r["ticker"],
                                 "year": r["year"],
                                 "annual_embed": "✅" if r["annual_embedded"] else "⬜",
-                                "bctc_embed": "✅" if r["bctc_embedded"] else "⬜",
+                                "financial_statement_embed": "✅" if r["financial_statement_embedded"] else "⬜",
                                 "edc": "✅" if r["edc_done"] else "⬜",
                                 "proper": "✅" if r["proper_done"] else "⬜",
                                 "gov": "✅" if r["gov_done"] else "⬜",
-                                "bctc_audit": "✅" if r["bctc_audit_done"] else "⬜",
+                                "financial_statement_audit": "✅" if r["financial_statement_audit_done"] else "⬜",
                             }
                             for r in rows
                         ],
@@ -4206,9 +4210,9 @@ def page_llm_tasks():
         def _make_llm_embed_task(state: TaskState, refresh: Callable) -> Callable:
             def run():
                 from llm_embeddings import embed_report
-                from llm_bctc_audit import (
-                    embed_bctc_report,
-                    sync_bctc_reports_from_markdown,
+                from llm_financial_statement_audit import (
+                    sync_financial_statement_reports_from_markdown,
+                    embed_financial_statement_report,
                 )
 
                 con = get_connection()
@@ -4217,7 +4221,7 @@ def page_llm_tasks():
 
                     embed_target = _selected_embed_target()
                     annual_pairs: list[tuple[str, int]] = []
-                    bctc_pairs: list[tuple[str, int]] = []
+                    financial_statement_pairs: list[tuple[str, int]] = []
 
                     if embed_target in {"annual", "both"}:
                         annual_pairs = (
@@ -4226,19 +4230,19 @@ def page_llm_tasks():
                             else _target_pairs(con)
                         )
 
-                    if embed_target in {"bctc", "both"}:
-                        sync_bctc_reports_from_markdown(
+                    if embed_target in {"financial_statement", "both"}:
+                        sync_financial_statement_reports_from_markdown(
                             con,
                             tickers=_selected_tickers(),
                             years=_selected_years(),
                         )
-                        bctc_pairs = (
-                            _all_bctc_pairs(con)
+                        financial_statement_pairs = (
+                            _all_financial_statement_pairs(con)
                             if _selected_embed_all()
-                            else _target_bctc_pairs(con)
+                            else _target_financial_statement_pairs(con)
                         )
 
-                    if not annual_pairs and not bctc_pairs:
+                    if not annual_pairs and not financial_statement_pairs:
                         state.summary = (
                             "No reports match selected filters for embedding target"
                         )
@@ -4286,9 +4290,9 @@ def page_llm_tasks():
                         )
                         refresh()
 
-                    for ticker, year in bctc_pairs:
+                    for ticker, year in financial_statement_pairs:
                         try:
-                            out = embed_bctc_report(
+                            out = embed_financial_statement_report(
                                 con,
                                 ticker,
                                 year,
@@ -4316,7 +4320,7 @@ def page_llm_tasks():
 
                         state.rows.append(
                             TaskRow(
-                                label=f"[BCTC] {ticker} / {year}",
+                                label=f"[FINANCIAL_STATEMENT] {ticker} / {year}",
                                 detail=str(detail),
                                 status=status,
                             )
@@ -4848,29 +4852,31 @@ def page_llm_tasks():
 
             return run
 
-        def _make_llm_extract_bctc_audit_task(
+        def _make_llm_extract_financial_statement_audit_task(
             state: TaskState, refresh: Callable
         ) -> Callable:
             def run():
-                from llm_bctc_audit import extract_bctc_audit_info
+                from llm_financial_statement_audit import (
+                    extract_financial_statement_audit_info,
+                )
 
                 con = get_connection()
                 try:
                     init_db(con)
                     ensure_vss_loaded(con)
 
-                    reports = _target_bctc_pairs(con)
+                    reports = _target_financial_statement_pairs(con)
                     reports = [
                         (t, y)
                         for t, y in reports
                         if con.execute(
-                            "SELECT 1 FROM bctc_document_embeddings "
+                            "SELECT 1 FROM financial_statement_document_embeddings "
                             "WHERE ticker = ? AND year = ? LIMIT 1",
                             [t, y],
                         ).fetchone()
                     ]
                     if not reports:
-                        state.summary = "No embedded BCTC reports match the selected filter"
+                        state.summary = "No embedded financial statements match the selected filter"
                         return
 
                     ok = 0
@@ -4878,7 +4884,7 @@ def page_llm_tasks():
                     skip = 0
                     for ticker, year in reports:
                         try:
-                            out = extract_bctc_audit_info(
+                            out = extract_financial_statement_audit_info(
                                 ticker,
                                 year,
                                 con=con,
@@ -4906,7 +4912,7 @@ def page_llm_tasks():
 
                         state.rows.append(
                             TaskRow(
-                                label=f"[BCTC AUDIT] {ticker} / {year}",
+                                label=f"[FINANCIAL_STATEMENT AUDIT] {ticker} / {year}",
                                 detail=detail,
                                 status=status,
                             )
@@ -4925,7 +4931,7 @@ def page_llm_tasks():
         @ui.refreshable
         def embed_panel():
             task_card(
-                "1. Embed Reports (Annual/BCTC)",
+                "1. Embed Reports (Annual/Financial Statement)",
                 embed_state,
                 _make_llm_embed_task(embed_state, embed_panel.refresh),
                 embed_panel.refresh,
@@ -4963,15 +4969,15 @@ def page_llm_tasks():
             )
 
         @ui.refreshable
-        def infer_bctc_audit_panel():
+        def infer_financial_statement_audit_panel():
             task_card(
-                "5. Extract BCTC Audit",
-                infer_bctc_audit_state,
-                _make_llm_extract_bctc_audit_task(
-                    infer_bctc_audit_state,
-                    infer_bctc_audit_panel.refresh,
+                "5. Extract Financial Statement Audit",
+                infer_financial_statement_audit_state,
+                _make_llm_extract_financial_statement_audit_task(
+                    infer_financial_statement_audit_state,
+                    infer_financial_statement_audit_panel.refresh,
                 ),
-                infer_bctc_audit_panel.refresh,
+                infer_financial_statement_audit_panel.refresh,
             )
 
         @ui.refreshable
@@ -5029,7 +5035,7 @@ def page_llm_tasks():
                 infer_edc_panel()
                 infer_proper_panel()
                 infer_gov_panel()
-                infer_bctc_audit_panel()
+                infer_financial_statement_audit_panel()
 
 
 @ui.page("/llm-query")
@@ -5041,7 +5047,7 @@ def page_llm_query():
     with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
         ui.label("LLM Extracted Items Query").classes("text-2xl font-bold")
         ui.label(
-            "Query extracted outputs from EDC, PROPER-VN, annual Governance, and BCTC audit pipelines."
+            "Query extracted outputs from EDC, PROPER-VN, annual Governance, and financial-statement audit pipelines."
         ).classes("text-sm text-gray-600")
 
         with ui.card().classes("w-full"):
@@ -5056,7 +5062,7 @@ def page_llm_query():
                             "edc_alt_two": "EDC Alternative 2 Results (HyDE2)",
                             "proper": "PROPER-VN Results",
                             "governance": "Governance Results (Annual, no GOV_AUDIT)",
-                            "bctc_audit": "BCTC Audit Results",
+                            "financial_statement_audit": "Financial Statement Audit Results",
                         },
                         value="edc",
                     )
@@ -5397,7 +5403,7 @@ def page_llm_query():
                         SELECT ticker, year, found,
                                audit_firm, audit_opinion, signing_auditor_names,
                                reason, model, created_at
-                        FROM bctc_audit_results
+                        FROM financial_statement_audit_results
                         {where}
                         ORDER BY ticker, year DESC
                         LIMIT ?
@@ -5564,7 +5570,7 @@ def page_llm_inputs():
                             "edc_alt_two": "EDC (Alternative 2)",
                             "proper_vn": "PROPER-VN",
                             "governance": "Governance",
-                            "bctc_audit": "BCTC Audit",
+                            "financial_statement_audit": "Financial Statement Audit",
                         },
                         value="all",
                     )
@@ -6467,7 +6473,7 @@ def page_extract_items():
     with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
         ui.label("Extracted Items Browser").classes("text-2xl font-bold")
         ui.label(
-            "Browse extracted EDC, PROPER-VN, annual Governance items, and BCTC audit items across ticker/year with filters."
+            "Browse extracted EDC, PROPER-VN, annual Governance items, and financial-statement audit items across ticker/year with filters."
         ).classes("text-sm text-gray-600")
 
         with ui.card().classes("w-full"):
@@ -6483,7 +6489,7 @@ def page_extract_items():
                             "edc_alt_two": "EDC (Alternative 2)",
                             "proper": "PROPER-VN",
                             "governance": "Governance (Annual, no GOV_AUDIT)",
-                            "bctc_audit": "BCTC Audit",
+                            "financial_statement_audit": "Financial Statement Audit",
                         },
                         value="all",
                     )
@@ -6714,15 +6720,15 @@ def page_extract_items():
                 {gov_where}{' AND' if gov_where else ' WHERE'} item_code != 'GOV_AUDIT'
             """
 
-            bctc_where, bctc_params = _build_where(
+            financial_statement_where, financial_statement_params = _build_where(
                 code_col="COALESCE(audit_firm, '')",
                 status_col="found",
                 text_expr="COALESCE(reason, '') || ' ' || COALESCE(audit_firm, '') || ' ' || COALESCE(audit_opinion, '')",
             )
 
-            bctc_sql = f"""
+            financial_statement_sql = f"""
                 SELECT
-                    'BCTC_AUDIT' AS dataset,
+                    'FINANCIAL_STATEMENT_AUDIT' AS dataset,
                     ticker,
                     year,
                     COALESCE(audit_firm, '') AS item_code,
@@ -6731,8 +6737,8 @@ def page_extract_items():
                     reason,
                     model,
                     created_at
-                FROM bctc_audit_results
-                {bctc_where}
+                FROM financial_statement_audit_results
+                {financial_statement_where}
             """
 
             if dataset == "edc":
@@ -6770,13 +6776,13 @@ def page_extract_items():
                     LIMIT ?
                 """
                 params = gov_params + [limit]
-            elif dataset == "bctc_audit":
+            elif dataset == "financial_statement_audit":
                 sql = f"""
-                    {bctc_sql}
+                    {financial_statement_sql}
                     ORDER BY ticker, year DESC, item_code
                     LIMIT ?
                 """
-                params = bctc_params + [limit]
+                params = financial_statement_params + [limit]
             else:
                 sql = f"""
                     {edc_sql}
@@ -6789,7 +6795,7 @@ def page_extract_items():
                     UNION ALL
                     {gov_sql}
                     UNION ALL
-                    {bctc_sql}
+                    {financial_statement_sql}
                     ORDER BY ticker, year DESC, dataset, item_code
                     LIMIT ?
                 """
@@ -6799,7 +6805,7 @@ def page_extract_items():
                     + edc_params
                     + proper_params
                     + gov_params
-                    + bctc_params
+                    + financial_statement_params
                     + [limit]
                 )
 
@@ -8352,7 +8358,7 @@ def page_converter():
 
     def _output_dir_for_doc_type(doc_type: str) -> Path:
         if str(doc_type) == DOC_TYPE_AUDITED_CONSOLIDATED_FS:
-            return BCTC_MARKDOWN_DIR
+            return FINANCIAL_STATEMENT_MARKDOWN_DIR
         return MARKDOWN_DIR
 
     ui.dark_mode(False)
@@ -8360,7 +8366,7 @@ def page_converter():
     init_db()
 
     from converter import (
-        convert_bctc_to_markdown,
+        convert_financial_statement_to_markdown,
         create_jobs,
         get_job_log,
         run_job,
@@ -8375,7 +8381,7 @@ def page_converter():
     with ui.column().classes("w-full max-w-6xl mx-auto gap-4 p-4"):
         ui.label("Converter").classes("text-2xl font-bold")
         ui.label(
-            "Simple document and marker-pdf conversion manager for Annual Reports and BCTC."
+            "Simple document and marker-pdf conversion manager for Annual Reports and Financial Statements."
         ).classes("text-sm text-gray-600")
 
         live_state: dict[str, str | bool | int] = {
@@ -8475,8 +8481,8 @@ def page_converter():
                 "Skip processed files",
                 value=True,
             ).props("dense")
-            manual_bctc_fallback_toggle = ui.switch(
-                "BCTC: use manually extracted/renamed PDF fallback",
+            manual_financial_statement_fallback_toggle = ui.switch(
+                "Financial statement: use manually extracted/renamed PDF fallback",
                 value=False,
             ).props("dense")
 
@@ -8495,7 +8501,7 @@ def page_converter():
 
         with ui.tabs().classes("w-full") as converter_tabs:
             ui.tab("annual", label="Annual Reports")
-            ui.tab("bctc", label="BCTC")
+            ui.tab("financial_statement", label="Financial Statement")
 
         with ui.tab_panels(converter_tabs, value="annual").classes("w-full"):
             with ui.tab_panel("annual"):
@@ -8848,9 +8854,9 @@ def page_converter():
 
                 annual_panel()
 
-            with ui.tab_panel("bctc"):
+            with ui.tab_panel("financial_statement"):
                 @ui.refreshable
-                def bctc_panel() -> None:
+                def financial_statement_panel() -> None:
                     sy, ey = _selected_year_bounds()
                     ticker_where, ticker_params = _ticker_filter_sql()
 
@@ -8858,7 +8864,7 @@ def page_converter():
                     try:
                         rows = con.execute(
                             f"""
-                            WITH bctc_docs AS (
+                            WITH financial_statement_docs AS (
                                 SELECT
                                     ticker,
                                     TRY_CAST(regexp_extract(title, '(\\d{{4}})', 1) AS INTEGER) AS year,
@@ -8869,7 +8875,7 @@ def page_converter():
                                 GROUP BY ticker, year
                             )
                             SELECT ticker, year, doc_count, raw_count
-                            FROM bctc_docs
+                            FROM financial_statement_docs
                             WHERE year IS NOT NULL
                               AND year BETWEEN ? AND ?
                               {ticker_where}
@@ -8892,7 +8898,7 @@ def page_converter():
                         ticker_key = str(ticker).upper()
                         year_key = int(year)
                         has_markdown = "❌"
-                        ticker_dir = BCTC_MARKDOWN_DIR / ticker_key
+                        ticker_dir = FINANCIAL_STATEMENT_MARKDOWN_DIR / ticker_key
                         if ticker_dir.exists():
                             year_text = str(year_key)
                             for md_path in ticker_dir.rglob("*.md"):
@@ -8910,7 +8916,7 @@ def page_converter():
 
                         latest_log = ""
                         latest_result = ""
-                        pattern = f"bctc_{ticker_key}_{year_key}_*.log"
+                        pattern = f"financial_statement_{ticker_key}_{year_key}_*.log"
                         logs = sorted(
                             LOGS_DIR.glob(pattern),
                             key=lambda p: p.stat().st_mtime,
@@ -8937,7 +8943,7 @@ def page_converter():
                         )
 
                     with ui.row().classes("gap-2 flex-wrap"):
-                        def _sync_bctc_listings() -> None:
+                        def _sync_financial_statement_listings() -> None:
                             tickers: list[str] | None = None
                             ticker_filter = str(ticker_filter_input.value or "").strip().upper()
                             if ticker_filter:
@@ -8961,10 +8967,10 @@ def page_converter():
                                 )
                             finally:
                                 con2.close()
-                            ui.notify(f"BCTC listings synced for {len(out)} ticker(s)", type="positive")
-                            bctc_panel.refresh()
+                            ui.notify(f"Financial statement listings synced for {len(out)} ticker(s)", type="positive")
+                            financial_statement_panel.refresh()
 
-                        def _download_bctc_unsynced() -> None:
+                        def _download_financial_statement_unsynced() -> None:
                             con3 = get_connection()
                             try:
                                 out = download_all_unsynced(
@@ -8974,18 +8980,18 @@ def page_converter():
                             finally:
                                 con3.close()
                             total = sum(len(v) for v in out.values())
-                            ui.notify(f"Downloaded {total} BCTC PDF(s)", type="positive")
-                            bctc_panel.refresh()
+                            ui.notify(f"Downloaded {total} financial statement PDF(s)", type="positive")
+                            financial_statement_panel.refresh()
 
-                        ui.button("Sync BCTC Listings", on_click=_sync_bctc_listings, color="primary").props("dense")
-                        ui.button("Download Unsynced BCTC PDFs", on_click=_download_bctc_unsynced).props("dense outline")
+                        ui.button("Sync Financial Statement Listings", on_click=_sync_financial_statement_listings, color="primary").props("dense")
+                        ui.button("Download Unsynced Financial Statement PDFs", on_click=_download_financial_statement_unsynced).props("dense outline")
 
                     if not table_rows:
-                        ui.label("No BCTC rows match current filters").classes("text-gray-500 text-sm")
+                        ui.label("No financial-statement rows match current filters").classes("text-gray-500 text-sm")
                         return
 
-                    ui.label(f"{len(table_rows)} BCTC row(s)").classes("text-xs text-gray-500")
-                    bctc_table = ui.table(
+                    ui.label(f"{len(table_rows)} financial-statement row(s)").classes("text-xs text-gray-500")
+                    financial_statement_table = ui.table(
                         columns=[
                             {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
                             {"name": "year", "label": "Year", "field": "year", "align": "center"},
@@ -9000,17 +9006,17 @@ def page_converter():
                         selection="multiple",
                     ).classes("w-full").props("dense flat")
 
-                    bctc_preview = ui.code("Select one BCTC row for actions or details").classes(
+                    financial_statement_preview = ui.code("Select one financial-statement row for actions or details").classes(
                         "w-full max-h-72 overflow-auto text-xs"
                     )
 
-                    def _selected_bctc_rows_selected_only(
+                    def _selected_financial_statement_rows_selected_only(
                         *,
                         skip_processed: bool = False,
                     ) -> list[dict[str, object]]:
-                        selected = list(bctc_table.selected or [])
+                        selected = list(financial_statement_table.selected or [])
                         if not selected:
-                            ui.notify("Select one or more BCTC rows first", type="warning")
+                            ui.notify("Select one or more financial-statement rows first", type="warning")
                             return []
 
                         rows_by_id = {
@@ -9034,19 +9040,19 @@ def page_converter():
 
                         return resolved_rows
 
-                    def _selected_bctc_row() -> dict[str, object] | None:
-                        rows = _selected_bctc_rows_selected_only()
+                    def _selected_financial_statement_row() -> dict[str, object] | None:
+                        rows = _selected_financial_statement_rows_selected_only()
                         if not rows:
                             return None
                         return rows[0]
 
-                    def _selected_bctc_rows() -> list[dict[str, object]]:
+                    def _selected_financial_statement_rows() -> list[dict[str, object]]:
                         if bool(select_all_reports_toggle.value):
                             rows = list(table_rows)
                         else:
-                            rows = list(bctc_table.selected or [])
+                            rows = list(financial_statement_table.selected or [])
                             if not rows:
-                                ui.notify("Select one or more BCTC rows first", type="warning")
+                                ui.notify("Select one or more financial-statement rows first", type="warning")
                                 return []
 
                         if bool(skip_processed_toggle.value):
@@ -9057,13 +9063,13 @@ def page_converter():
                             ]
                         return rows
 
-                    def _convert_selected_bctc_rows() -> None:
-                        selected_rows = _selected_bctc_rows_selected_only(
+                    def _convert_selected_financial_statement_rows() -> None:
+                        selected_rows = _selected_financial_statement_rows_selected_only(
                             skip_processed=True
                         )
                         if not selected_rows:
                             if bool(skip_processed_toggle.value):
-                                ui.notify("No selected BCTC rows left after skipping processed files", type="warning")
+                                ui.notify("No selected financial-statement rows left after skipping processed files", type="warning")
                             return
 
                         def _work(on_hb: Callable[[int], None]) -> str:
@@ -9075,13 +9081,13 @@ def page_converter():
                                     ticker = str(row.get("ticker") or "").upper()
                                     year = int(str(row.get("year") or "0"))
                                     try:
-                                        convert_bctc_to_markdown(
+                                        convert_financial_statement_to_markdown(
                                             con4,
                                             ticker=ticker,
                                             year=year,
-                                            output_dir=BCTC_MARKDOWN_DIR,
+                                            output_dir=FINANCIAL_STATEMENT_MARKDOWN_DIR,
                                             allow_manual_updated_files=bool(
-                                                manual_bctc_fallback_toggle.value
+                                                manual_financial_statement_fallback_toggle.value
                                             ),
                                             on_heartbeat=on_hb,
                                         )
@@ -9090,19 +9096,19 @@ def page_converter():
                                         failed += 1
                             finally:
                                 con4.close()
-                            return f"Selected BCTC conversion finished: {ok} completed, {failed} failed"
+                            return f"Selected financial-statement conversion finished: {ok} completed, {failed} failed"
 
                         _run_conversion_background(
-                            f"BCTC selected batch ({len(selected_rows)} rows)",
+                            f"Financial statement selected batch ({len(selected_rows)} rows)",
                             _work,
-                            on_done=bctc_panel.refresh,
+                            on_done=financial_statement_panel.refresh,
                         )
 
-                    def _convert_filtered_bctc_rows() -> None:
-                        bctc_targets = _selected_bctc_rows()
-                        if not bctc_targets:
+                    def _convert_filtered_financial_statement_rows() -> None:
+                        financial_statement_targets = _selected_financial_statement_rows()
+                        if not financial_statement_targets:
                             if bool(skip_processed_toggle.value):
-                                ui.notify("No BCTC rows left after skipping processed files", type="warning")
+                                ui.notify("No financial-statement rows left after skipping processed files", type="warning")
                             return
 
                         def _work(on_hb: Callable[[int], None]) -> str:
@@ -9110,17 +9116,17 @@ def page_converter():
                             failed = 0
                             con5 = get_connection()
                             try:
-                                for row in bctc_targets:
+                                for row in financial_statement_targets:
                                     ticker = str(row.get("ticker") or "").upper()
                                     year = int(str(row.get("year") or "0"))
                                     try:
-                                        convert_bctc_to_markdown(
+                                        convert_financial_statement_to_markdown(
                                             con5,
                                             ticker=ticker,
                                             year=year,
-                                            output_dir=BCTC_MARKDOWN_DIR,
+                                            output_dir=FINANCIAL_STATEMENT_MARKDOWN_DIR,
                                             allow_manual_updated_files=bool(
-                                                manual_bctc_fallback_toggle.value
+                                                manual_financial_statement_fallback_toggle.value
                                             ),
                                             on_heartbeat=on_hb,
                                         )
@@ -9129,40 +9135,40 @@ def page_converter():
                                         failed += 1
                             finally:
                                 con5.close()
-                            return f"BCTC conversion finished: {ok} completed, {failed} failed"
+                            return f"Financial statement conversion finished: {ok} completed, {failed} failed"
 
                         _run_conversion_background(
-                            "BCTC filtered conversion",
+                            "Financial statement filtered conversion",
                             _work,
-                            on_done=bctc_panel.refresh,
+                            on_done=financial_statement_panel.refresh,
                         )
 
-                    def _view_selected_bctc_log() -> None:
-                        row = _selected_bctc_row()
+                    def _view_selected_financial_statement_log() -> None:
+                        row = _selected_financial_statement_row()
                         if not row:
                             return
                         ticker = str(row.get("ticker") or "").upper()
                         year = int(str(row.get("year") or "0"))
-                        pattern = f"bctc_{ticker}_{year}_*.log"
+                        pattern = f"financial_statement_{ticker}_{year}_*.log"
                         logs = sorted(
                             LOGS_DIR.glob(pattern),
                             key=lambda p: p.stat().st_mtime,
                             reverse=True,
                         )
                         if not logs:
-                            bctc_preview.set_content("No log found for selected row")
+                            financial_statement_preview.set_content("No log found for selected row")
                             return
-                        bctc_preview.set_content(logs[0].read_text(errors="replace"))
+                        financial_statement_preview.set_content(logs[0].read_text(errors="replace"))
 
-                    def _open_selected_bctc_output() -> None:
-                        row = _selected_bctc_row()
+                    def _open_selected_financial_statement_output() -> None:
+                        row = _selected_financial_statement_row()
                         if not row:
                             return
                         ticker = str(row.get("ticker") or "").upper()
                         year = int(str(row.get("year") or "0"))
-                        folder = BCTC_MARKDOWN_DIR / ticker
+                        folder = FINANCIAL_STATEMENT_MARKDOWN_DIR / ticker
                         if not folder.exists():
-                            bctc_preview.set_content(f"Folder not found: {folder}")
+                            financial_statement_preview.set_content(f"Folder not found: {folder}")
                             return
                         year_text = str(year)
                         matches: list[str] = []
@@ -9170,25 +9176,25 @@ def page_converter():
                             haystack = " ".join((md_path.name, md_path.stem, md_path.parent.name, md_path.as_posix()))
                             if year_text in haystack:
                                 matches.append(str(md_path))
-                        bctc_preview.set_content(
+                        financial_statement_preview.set_content(
                             f"Output folder: {folder}\n\n" + ("\n".join(matches) if matches else "No markdown files found for selected year")
                         )
 
                     with ui.row().classes("gap-2 mt-2 flex-wrap"):
-                        ui.button("Convert Selected BCTC", on_click=_convert_selected_bctc_rows, color="primary").props("dense")
-                        ui.button("Run BCTC Batch", on_click=_convert_filtered_bctc_rows).props("dense outline")
-                        ui.button("View Selected Log", on_click=_view_selected_bctc_log).props("dense outline")
-                        ui.button("Open Output Folder", on_click=_open_selected_bctc_output).props("dense outline")
+                        ui.button("Convert Selected Financial Statements", on_click=_convert_selected_financial_statement_rows, color="primary").props("dense")
+                        ui.button("Run Financial Statement Batch", on_click=_convert_filtered_financial_statement_rows).props("dense outline")
+                        ui.button("View Selected Log", on_click=_view_selected_financial_statement_log).props("dense outline")
+                        ui.button("Open Output Folder", on_click=_open_selected_financial_statement_output).props("dense outline")
 
-                bctc_panel()
+                financial_statement_panel()
 
         with ui.row().classes("gap-2"):
             ui.button("Refresh Annual", on_click=lambda: annual_panel.refresh()).props("dense outline")
-            ui.button("Refresh BCTC", on_click=lambda: bctc_panel.refresh()).props("dense outline")
+            ui.button("Refresh Financial Statement", on_click=lambda: financial_statement_panel.refresh()).props("dense outline")
 
-        ticker_filter_input.on_value_change(lambda _: (annual_panel.refresh(), bctc_panel.refresh()))
-        start_year_input.on_value_change(lambda _: (annual_panel.refresh(), bctc_panel.refresh()))
-        end_year_input.on_value_change(lambda _: (annual_panel.refresh(), bctc_panel.refresh()))
+        ticker_filter_input.on_value_change(lambda _: (annual_panel.refresh(), financial_statement_panel.refresh()))
+        start_year_input.on_value_change(lambda _: (annual_panel.refresh(), financial_statement_panel.refresh()))
+        end_year_input.on_value_change(lambda _: (annual_panel.refresh(), financial_statement_panel.refresh()))
 
     return
 

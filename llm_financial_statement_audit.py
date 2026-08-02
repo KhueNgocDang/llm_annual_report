@@ -1,10 +1,10 @@
-"""BCTC audit extraction pipeline (BCTC-only).
+"""Financial-statement audit extraction pipeline.
 
 This module is intentionally separate from annual-report governance extraction.
 It uses dedicated DuckDB tables:
-- bctc_reports
-- bctc_document_embeddings
-- bctc_audit_results
+- financial_statement_reports
+- financial_statement_document_embeddings
+- financial_statement_audit_results
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 import duckdb
 
 from config import (
-    BCTC_MARKDOWN_DIR,
+    FINANCIAL_STATEMENT_MARKDOWN_DIR,
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     EMBEDDING_CHUNK_OVERLAP,
@@ -41,15 +41,15 @@ except Exception:  # pragma: no cover
 
 
 MAX_PROMPT_CONTENT_TOKENS = 120000
-_BCTC_AUDIT_QUERY = (
-    "Trich xuat thong tin kiem toan doc lap trong BCTC: ten cong ty kiem toan, "
+_FINANCIAL_STATEMENT_AUDIT_QUERY = (
+    "Trich xuat thong tin kiem toan doc lap trong bao cao tai chinh: ten cong ty kiem toan, "
     "y kien kiem toan (chap nhan toan phan/ngoai tru/tu choi/khong dua ra y kien), "
     "va kiem toan vien ky bao cao."
 )
 
-_BCTC_AUDIT_PROMPT = """You are a structured data extraction assistant for Vietnamese audited consolidated financial statements (BCTC).
+_FINANCIAL_STATEMENT_AUDIT_PROMPT = """You are a structured data extraction assistant for Vietnamese audited consolidated financial statements.
 
-Extract external audit information from the provided BCTC text.
+Extract external audit information from the provided financial-statement text.
 
 Return ONLY a JSON object with exactly these keys:
 - "found": boolean
@@ -120,7 +120,7 @@ def _get_audit_query_embedding(
         return _audit_query_embedding
 
     vectors = get_embeddings(
-        [_BCTC_AUDIT_QUERY],
+        [_FINANCIAL_STATEMENT_AUDIT_QUERY],
         model=model or EMBEDDING_MODEL,
         dimensions=dimensions or EMBEDDING_DIMENSIONS,
     )
@@ -128,14 +128,14 @@ def _get_audit_query_embedding(
     return _audit_query_embedding
 
 
-def sync_bctc_reports_from_markdown(
+def sync_financial_statement_reports_from_markdown(
     con: duckdb.DuckDBPyConnection,
     *,
-    source_dir: str | Path = BCTC_MARKDOWN_DIR,
+    source_dir: str | Path = FINANCIAL_STATEMENT_MARKDOWN_DIR,
     tickers: list[str] | None = None,
     years: list[int] | None = None,
 ) -> dict[str, int]:
-    """Load BCTC markdown files into bctc_reports table."""
+    """Load financial-statement markdown files into financial_statement_reports."""
     source_path = Path(source_dir)
     if not source_path.exists():
         return {"loaded": 0, "failed": 0}
@@ -171,7 +171,7 @@ def sync_bctc_reports_from_markdown(
 
             con.execute(
                 """
-                INSERT INTO bctc_reports (ticker, year, content, source_file)
+                INSERT INTO financial_statement_reports (ticker, year, content, source_file)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT (ticker, year) DO UPDATE SET
                     content = EXCLUDED.content,
@@ -187,7 +187,7 @@ def sync_bctc_reports_from_markdown(
     return {"loaded": loaded, "failed": failed}
 
 
-def embed_bctc_report(
+def embed_financial_statement_report(
     con: duckdb.DuckDBPyConnection,
     ticker: str,
     year: int,
@@ -198,10 +198,10 @@ def embed_bctc_report(
     chunk_size: int = EMBEDDING_CHUNK_SIZE,
     chunk_overlap: int = EMBEDDING_CHUNK_OVERLAP,
 ) -> dict[str, int | str | bool]:
-    """Embed one BCTC report into bctc_document_embeddings."""
+    """Embed one financial statement into financial_statement_document_embeddings."""
     ticker_u = ticker.upper()
     row = con.execute(
-        "SELECT content FROM bctc_reports WHERE ticker = ? AND year = ?",
+        "SELECT content FROM financial_statement_reports WHERE ticker = ? AND year = ?",
         [ticker_u, year],
     ).fetchone()
     if not row:
@@ -211,11 +211,11 @@ def embed_bctc_report(
             "embedded": 0,
             "skipped": 1,
             "failed": 0,
-            "reason": "bctc_report_not_found",
+            "reason": "financial_statement_report_not_found",
         }
 
     existing = con.execute(
-        "SELECT COUNT(*) FROM bctc_document_embeddings WHERE ticker = ? AND year = ?",
+        "SELECT COUNT(*) FROM financial_statement_document_embeddings WHERE ticker = ? AND year = ?",
         [ticker_u, year],
     ).fetchone()[0]
     if existing > 0 and not replace:
@@ -230,7 +230,7 @@ def embed_bctc_report(
 
     if replace:
         con.execute(
-            "DELETE FROM bctc_document_embeddings WHERE ticker = ? AND year = ?",
+            "DELETE FROM financial_statement_document_embeddings WHERE ticker = ? AND year = ?",
             [ticker_u, year],
         )
 
@@ -257,7 +257,7 @@ def embed_bctc_report(
 
     con.executemany(
         """
-        INSERT INTO bctc_document_embeddings
+        INSERT INTO financial_statement_document_embeddings
             (ticker, year, chunk_index, chunk_text, token_count, embedding, model)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (ticker, year, chunk_index) DO UPDATE SET
@@ -291,7 +291,7 @@ def embed_bctc_report(
     }
 
 
-def retrieve_bctc_chunks_for_audit(
+def retrieve_financial_statement_chunks_for_audit(
     con: duckdb.DuckDBPyConnection,
     ticker: str,
     year: int,
@@ -300,7 +300,7 @@ def retrieve_bctc_chunks_for_audit(
     embedding_model: str | None = None,
     dimensions: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Retrieve top-k BCTC chunks for audit extraction."""
+    """Retrieve top-k financial-statement chunks for audit extraction."""
     qvec = _get_audit_query_embedding(
         model=embedding_model,
         dimensions=dimensions,
@@ -313,7 +313,7 @@ def retrieve_bctc_chunks_for_audit(
             chunk_text,
             token_count,
             list_cosine_distance(embedding::FLOAT[], ?::FLOAT[]) AS distance
-        FROM bctc_document_embeddings
+        FROM financial_statement_document_embeddings
         WHERE ticker = ? AND year = ?
         ORDER BY distance ASC
         LIMIT ?
@@ -356,7 +356,7 @@ def _evaluate_audit_from_chunks(
     if not selected_chunks:
         selected_chunks = [""]
 
-    prompt = _BCTC_AUDIT_PROMPT.format(content="\n".join(selected_chunks))
+    prompt = _FINANCIAL_STATEMENT_AUDIT_PROMPT.format(content="\n".join(selected_chunks))
 
     client = _get_client()
     raw = run_chat_json_batch(
@@ -393,14 +393,14 @@ def _evaluate_audit_from_chunks(
     return result
 
 
-def get_bctc_audit_result(
+def get_financial_statement_audit_result(
     con: duckdb.DuckDBPyConnection,
     ticker: str,
     year: int,
     *,
     model: str | None = None,
 ) -> dict[str, Any] | None:
-    """Read one stored BCTC audit result."""
+    """Read one stored financial-statement audit result."""
     row = con.execute(
         """
         SELECT
@@ -417,7 +417,7 @@ def get_bctc_audit_result(
             similarities,
             model,
             created_at
-        FROM bctc_audit_results
+        FROM financial_statement_audit_results
         WHERE ticker = ? AND year = ? AND model = ?
         """,
         [ticker.upper(), year, model or INFERENCE_MODEL],
@@ -442,7 +442,7 @@ def get_bctc_audit_result(
     }
 
 
-def extract_bctc_audit_info(
+def extract_financial_statement_audit_info(
     ticker: str,
     year: int,
     con: duckdb.DuckDBPyConnection | None = None,
@@ -453,7 +453,7 @@ def extract_bctc_audit_info(
     embedding_model: str | None = None,
     dimensions: int | None = None,
 ) -> dict[str, Any]:
-    """Extract audit firm and opinion for one BCTC report."""
+    """Extract audit firm and opinion for one financial statement."""
     own_con = con is None
     if own_con:
         con = get_connection()
@@ -465,42 +465,47 @@ def extract_bctc_audit_info(
     model_name = inference_model or INFERENCE_MODEL
 
     report_row = con.execute(
-        "SELECT source_file FROM bctc_reports WHERE ticker = ? AND year = ?",
+        "SELECT source_file FROM financial_statement_reports WHERE ticker = ? AND year = ?",
         [ticker_u, year],
     ).fetchone()
     if not report_row:
         if own_con:
             con.close()
         raise ValueError(
-            f"No BCTC report in bctc_reports for {ticker_u}/{year}. "
-            "Run sync_bctc_reports_from_markdown first."
+            "No financial statement in financial_statement_reports for "
+            f"{ticker_u}/{year}. Run sync_financial_statement_reports_from_markdown first."
         )
 
     if replace:
         con.execute(
-            "DELETE FROM bctc_audit_results WHERE ticker = ? AND year = ? AND model = ?",
+            "DELETE FROM financial_statement_audit_results WHERE ticker = ? AND year = ? AND model = ?",
             [ticker_u, year, model_name],
         )
     else:
-        existing = get_bctc_audit_result(con, ticker_u, year, model=model_name)
+        existing = get_financial_statement_audit_result(
+            con,
+            ticker_u,
+            year,
+            model=model_name,
+        )
         if existing is not None:
             if own_con:
                 con.close()
             return existing
 
     emb_count = con.execute(
-        "SELECT COUNT(*) FROM bctc_document_embeddings WHERE ticker = ? AND year = ?",
+        "SELECT COUNT(*) FROM financial_statement_document_embeddings WHERE ticker = ? AND year = ?",
         [ticker_u, year],
     ).fetchone()[0]
     if int(emb_count) <= 0:
         if own_con:
             con.close()
         raise ValueError(
-            f"No embeddings in bctc_document_embeddings for {ticker_u}/{year}. "
-            "Run embed_bctc_report first."
+            "No embeddings in financial_statement_document_embeddings for "
+            f"{ticker_u}/{year}. Run embed_financial_statement_report first."
         )
 
-    chunks = retrieve_bctc_chunks_for_audit(
+    chunks = retrieve_financial_statement_chunks_for_audit(
         con,
         ticker_u,
         year,
@@ -529,7 +534,7 @@ def extract_bctc_audit_info(
 
     con.execute(
         """
-        INSERT INTO bctc_audit_results
+        INSERT INTO financial_statement_audit_results
             (ticker, year, found, audit_firm, audit_opinion, signing_auditor_names,
              value_json, details_json, reason, top_chunks, similarities, model)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -561,7 +566,12 @@ def extract_bctc_audit_info(
         ],
     )
 
-    out = get_bctc_audit_result(con, ticker_u, year, model=model_name)
+    out = get_financial_statement_audit_result(
+        con,
+        ticker_u,
+        year,
+        model=model_name,
+    )
     if own_con:
         con.close()
     return out or {
@@ -581,7 +591,7 @@ def extract_bctc_audit_info(
     }
 
 
-def extract_bctc_audit_info_all_reports(
+def extract_financial_statement_audit_info_all_reports(
     con: duckdb.DuckDBPyConnection | None = None,
     *,
     tickers: list[str] | None = None,
@@ -592,7 +602,7 @@ def extract_bctc_audit_info_all_reports(
     embedding_model: str | None = None,
     dimensions: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Run BCTC audit extraction for all embedded BCTC reports."""
+    """Run audit extraction for all embedded financial statements."""
     own_con = con is None
     if own_con:
         con = get_connection()
@@ -601,7 +611,7 @@ def extract_bctc_audit_info_all_reports(
     ensure_vss_loaded(con)
 
     rows = con.execute(
-        "SELECT DISTINCT ticker, year FROM bctc_document_embeddings ORDER BY ticker, year"
+        "SELECT DISTINCT ticker, year FROM financial_statement_document_embeddings ORDER BY ticker, year"
     ).fetchall()
     reports = [(str(r[0]).upper(), int(r[1])) for r in rows]
 
@@ -616,7 +626,7 @@ def extract_bctc_audit_info_all_reports(
     for ticker, year in reports:
         try:
             out.append(
-                extract_bctc_audit_info(
+                extract_financial_statement_audit_info(
                     ticker,
                     year,
                     con=con,

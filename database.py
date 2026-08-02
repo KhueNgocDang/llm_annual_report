@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS annual_reports (
     PRIMARY KEY (ticker, year)
 );
 
-CREATE TABLE IF NOT EXISTS bctc_reports (
+CREATE TABLE IF NOT EXISTS financial_statement_reports (
     ticker      VARCHAR NOT NULL,
     year        INTEGER NOT NULL,
     content     VARCHAR NOT NULL,
@@ -159,7 +159,7 @@ CREATE TABLE IF NOT EXISTS document_embeddings (
     PRIMARY KEY (ticker, year, chunk_index)
 );
 
-CREATE TABLE IF NOT EXISTS bctc_document_embeddings (
+CREATE TABLE IF NOT EXISTS financial_statement_document_embeddings (
     ticker      VARCHAR NOT NULL,
     year        INTEGER NOT NULL,
     chunk_index INTEGER NOT NULL,
@@ -171,10 +171,10 @@ CREATE TABLE IF NOT EXISTS bctc_document_embeddings (
     PRIMARY KEY (ticker, year, chunk_index)
 );
 
-CREATE SEQUENCE IF NOT EXISTS bctc_audit_results_id_seq START 1;
+CREATE SEQUENCE IF NOT EXISTS financial_statement_audit_results_id_seq START 1;
 
-CREATE TABLE IF NOT EXISTS bctc_audit_results (
-    id                    INTEGER PRIMARY KEY DEFAULT nextval('bctc_audit_results_id_seq'),
+CREATE TABLE IF NOT EXISTS financial_statement_audit_results (
+    id                    INTEGER PRIMARY KEY DEFAULT nextval('financial_statement_audit_results_id_seq'),
     ticker                VARCHAR NOT NULL,
     year                  INTEGER NOT NULL,
     found                 BOOLEAN NOT NULL,
@@ -540,6 +540,69 @@ def _get_table_type(
     return str(row[0]) if row else None
 
 
+def _sequence_exists(
+    con: duckdb.DuckDBPyConnection,
+    sequence_name: str,
+) -> bool:
+    row = con.execute(
+        """
+        SELECT 1
+                FROM pg_catalog.pg_sequences
+                WHERE schemaname = current_schema()
+                    AND sequencename = ?
+        """,
+        [sequence_name],
+    ).fetchone()
+    return row is not None
+
+
+def _migrate_legacy_financial_statement_objects(
+    con: duckdb.DuckDBPyConnection,
+) -> None:
+    legacy_tables = (
+        ("bctc_reports", "financial_statement_reports"),
+        (
+            "bctc_document_embeddings",
+            "financial_statement_document_embeddings",
+        ),
+        ("bctc_audit_results", "financial_statement_audit_results"),
+    )
+    for legacy_name, new_name in legacy_tables:
+        if _get_table_type(con, legacy_name) and not _get_table_type(con, new_name):
+            con.execute(f"ALTER TABLE {legacy_name} RENAME TO {new_name}")
+
+    new_seq = "financial_statement_audit_results_id_seq"
+    if not _sequence_exists(con, new_seq):
+        next_id = 1
+        if _get_table_type(con, "financial_statement_audit_results"):
+            next_row = con.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM financial_statement_audit_results"
+            ).fetchone()
+            next_id = int(next_row[0]) if next_row else 1
+        con.execute(
+            f"CREATE SEQUENCE IF NOT EXISTS {new_seq} START {max(1, next_id)}"
+        )
+
+    if _get_table_type(con, "financial_statement_audit_results"):
+        con.execute(
+            "ALTER TABLE financial_statement_audit_results "
+            "ALTER COLUMN id SET DEFAULT "
+            "nextval('financial_statement_audit_results_id_seq')"
+        )
+    if _get_table_type(con, "financial_statement_reports"):
+        con.execute(
+            """
+            UPDATE financial_statement_reports
+            SET source_file = replace(
+                source_file,
+                'markdown_bctc/',
+                'markdown_financial_statement/'
+            )
+            WHERE source_file LIKE '%markdown_bctc/%'
+            """
+        )
+
+
 def _ensure_parquet_snapshot_from_table(
     con: duckdb.DuckDBPyConnection,
     *,
@@ -627,6 +690,8 @@ def init_db(con: duckdb.DuckDBPyConnection | None = None) -> None:
             if _INIT_DB_DONE:
                 return
 
+            _migrate_legacy_financial_statement_objects(con)
+
             for stmt in _SCHEMA_SQL.strip().split(";"):
                 stmt = stmt.strip()
                 if stmt:
@@ -694,7 +759,7 @@ def delete_company(
         Dict mapping table name -> number of rows deleted.
     """
     import shutil
-    from config import BCTC_MARKDOWN_DIR, RAW_DIR
+    from config import FINANCIAL_STATEMENT_MARKDOWN_DIR, RAW_DIR
     from config_marker import MARKDOWN_DIR
 
     t = ticker.upper()
@@ -705,10 +770,10 @@ def delete_company(
         ("company_history_summary", "ticker"),
         ("conversion_jobs", "ticker"),
         ("annual_reports", "ticker"),
-        ("bctc_reports", "ticker"),
+        ("financial_statement_reports", "ticker"),
         ("pipeline_files", "ticker"),
-        ("bctc_document_embeddings", "ticker"),
-        ("bctc_audit_results", "ticker"),
+        ("financial_statement_document_embeddings", "ticker"),
+        ("financial_statement_audit_results", "ticker"),
         ("vietstock_documents", "ticker"),
         ("financial_ratios", "code"),
         ("financial_statements", "code"),
@@ -723,7 +788,7 @@ def delete_company(
 
     # Clean up files on disk
     files_removed = 0
-    for d in [RAW_DIR / t, MARKDOWN_DIR / t, BCTC_MARKDOWN_DIR / t]:
+    for d in [RAW_DIR / t, MARKDOWN_DIR / t, FINANCIAL_STATEMENT_MARKDOWN_DIR / t]:
         if d.is_dir():
             files_removed += sum(1 for _ in d.rglob("*") if _.is_file())
             shutil.rmtree(d)

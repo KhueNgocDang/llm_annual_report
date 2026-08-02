@@ -36,8 +36,8 @@ def _extract_year_from_title(title: str) -> int | None:
     return year if 2000 <= year <= 2100 else None
 
 
-def _bctc_title_quality_score(title: str) -> int:
-    """Score BCTC titles so full audited reports rank above adjustment notices."""
+def _financial_statement_title_quality_score(title: str) -> int:
+    """Score financial-statement titles so full audited reports rank above notices."""
     text = _normalize_vi_text(title or "")
     score = 0
 
@@ -725,7 +725,7 @@ def download_all_unsynced(
     rows = con.execute(sql, params).fetchall()
 
     if str(doc_type or "") == DOC_TYPE_AUDITED_CONSOLIDATED_FS:
-        # Prefer full audited BCTC over adjustment notices within the same ticker/year.
+        # Prefer full audited financial statements over adjustment notices within the same ticker/year.
         ranked_rows: list[tuple[int, str, str, str | None]] = []
         by_group: dict[tuple[str, int], list[tuple[int, str, str, str | None]]] = {}
         no_year_rows: list[tuple[int, str, str, str | None]] = []
@@ -742,7 +742,7 @@ def download_all_unsynced(
         for group_rows in by_group.values():
             group_rows.sort(
                 key=lambda r: (
-                    _bctc_title_quality_score(r[2]),
+                    _financial_statement_title_quality_score(r[2]),
                     str(r[3] or ""),
                     r[0],
                 ),

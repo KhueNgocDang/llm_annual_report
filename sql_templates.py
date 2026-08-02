@@ -27,7 +27,7 @@ sup AS (
 ),
 aud AS (
     SELECT ticker, year, model, value_json
-    FROM bctc_audit_results
+    FROM financial_statement_audit_results
 )
 SELECT
     b.ticker,

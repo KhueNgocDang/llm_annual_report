@@ -19,7 +19,7 @@ from typing import Callable, Optional, TypedDict
 
 import duckdb
 
-from config import BCTC_MARKDOWN_DIR, OUTPUT_DIR, RAW_DIR
+from config import FINANCIAL_STATEMENT_MARKDOWN_DIR, OUTPUT_DIR, RAW_DIR
 from config_marker import DATA_DIR, MARKDOWN_DIR, LOGS_DIR, MARKER_EXTRA_ARGS
 from database import ensure_company, get_connection
 from vietstock_documents import (
@@ -42,13 +42,17 @@ def _job_kind_from_output_dir(output_dir: str | Path) -> str:
         resolved = Path(output_dir).resolve()
     except Exception:
         resolved = Path(output_dir)
-    return "bctc" if resolved == Path(BCTC_MARKDOWN_DIR).resolve() else "annual"
+    return (
+        "financial_statement"
+        if resolved == Path(FINANCIAL_STATEMENT_MARKDOWN_DIR).resolve()
+        else "annual"
+    )
 
 
 def _default_output_dir_for_doc_type(doc_type: str) -> Path:
     """Map Vietstock doc_type to converter output root directory."""
     if str(doc_type) == DOC_TYPE_AUDITED_CONSOLIDATED_FS:
-        return Path(BCTC_MARKDOWN_DIR)
+        return Path(FINANCIAL_STATEMENT_MARKDOWN_DIR)
     return Path(MARKDOWN_DIR)
 
 
@@ -460,7 +464,7 @@ def create_jobs(
     """
     if str(doc_type) != DOC_TYPE_ANNUAL_REPORT:
         raise ValueError(
-            "conversion_jobs supports annual reports only; use convert_bctc_to_markdown for BCTC management"
+            "conversion_jobs supports annual reports only; use convert_financial_statement_to_markdown for financial-statement management"
         )
 
     output_dir = str(output_dir or _default_output_dir_for_doc_type(doc_type))
@@ -988,7 +992,7 @@ def run_job(
         return False
 
 
-def convert_bctc_to_markdown(
+def convert_financial_statement_to_markdown(
     con: duckdb.DuckDBPyConnection,
     ticker: str,
     year: int,
@@ -996,9 +1000,9 @@ def convert_bctc_to_markdown(
     allow_manual_updated_files: bool = False,
     on_heartbeat: Callable[[int], None] | None = None,
 ) -> Path:
-    """Convert latest synced BCTC PDF for ticker/year to markdown via marker_single.
+    """Convert latest synced financial-statement PDF for ticker/year to markdown.
 
-    This writes to a dedicated BCTC markdown directory to avoid clashing with
+    This writes to a dedicated financial-statement markdown directory to avoid clashing with
     annual-report markdown ingestion.
     """
     rows = con.execute(
@@ -1018,10 +1022,10 @@ def convert_bctc_to_markdown(
 
     if not rows:
         raise ValueError(
-            f"No synced BCTC PDF found for {str(ticker).upper()}-{int(year)}"
+            f"No synced financial statement PDF found for {str(ticker).upper()}-{int(year)}"
         )
 
-    def _bctc_title_quality_score(title: str | None) -> int:
+    def _financial_statement_title_quality_score(title: str | None) -> int:
         text = str(title or "").lower()
 
         score = 0
@@ -1077,7 +1081,7 @@ def convert_bctc_to_markdown(
         except Exception:
             size = 0
 
-        title_score = _bctc_title_quality_score(candidate_title)
+        title_score = _financial_statement_title_quality_score(candidate_title)
         has_adjustment_marker = 1 if title_score < 0 else 0
 
         # Ranking priority:
@@ -1100,18 +1104,20 @@ def convert_bctc_to_markdown(
 
     if best_candidate is None or best_doc_id is None:
         raise ValueError(
-            f"No readable BCTC source file found for {str(ticker).upper()}-{int(year)}"
+            f"No readable financial statement source file found for {str(ticker).upper()}-{int(year)}"
         )
 
     doc_id = best_doc_id
     source_file = best_candidate[-1]
 
-    out_root = Path(output_dir or BCTC_MARKDOWN_DIR)
+    out_root = Path(output_dir or FINANCIAL_STATEMENT_MARKDOWN_DIR)
     out_dir = out_root / str(ticker).upper()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOGS_DIR / f"bctc_{str(ticker).upper()}_{int(year)}_{int(doc_id)}.log"
+    log_path = LOGS_DIR / (
+        f"financial_statement_{str(ticker).upper()}_{int(year)}_{int(doc_id)}.log"
+    )
 
     cmd = [
         "marker_single",
@@ -1134,7 +1140,7 @@ def convert_bctc_to_markdown(
 
     with open(log_path, "w") as log_file:
         log_file.write(
-            f"=== BCTC marker conversion: {str(ticker).upper()} {int(year)} (doc_id={int(doc_id)}) ===\n"
+            f"=== Financial statement marker conversion: {str(ticker).upper()} {int(year)} (doc_id={int(doc_id)}) ===\n"
         )
         log_file.write(
             f"OCR mode: {'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
@@ -1163,7 +1169,8 @@ def convert_bctc_to_markdown(
 
     if return_code != 0:
         raise RuntimeError(
-            f"marker_single failed for BCTC {str(ticker).upper()}-{int(year)}; see {log_path}"
+            "marker_single failed for financial statement "
+            f"{str(ticker).upper()}-{int(year)}; see {log_path}"
         )
 
     return out_dir

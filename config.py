@@ -24,7 +24,7 @@ DEFAULT_END_YEAR = 2025
 # LLM pipeline directories and metadata
 STAGING_DIR = DATA_DIR / "staging"
 MARKDOWN_DIR = DATA_DIR / "markdown"
-BCTC_MARKDOWN_DIR = DATA_DIR / "markdown_bctc"
+FINANCIAL_STATEMENT_MARKDOWN_DIR = DATA_DIR / "markdown_financial_statement"
 LOGS_DIR = DATA_DIR / "logs"
 ENV_JSON_PATH = BASE_DIR / "env.json"
 
