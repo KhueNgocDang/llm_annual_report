@@ -1,511 +1,129 @@
 from __future__ import annotations
 
-from datetime import datetime
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
 
-from nicegui import ui
-
-from config import DB_PATH, DEFAULT_END_YEAR, DEFAULT_START_YEAR, bootstrap_directories
-from database import (
-    connection_scope,
-    delete_company,
-    ensure_company,
-    init_db,
-    list_companies,
-)
-from financial_data import sync_stocks
-from financial_data import (
-    sync_financial_models,
-    sync_financial_ratios_all,
-    sync_financial_statements_all,
-)
-from report_loader import (
-    load_annual_reports_from_markdown,
-    load_financial_statement_reports_from_markdown,
-)
-from vietstock_documents import (
-    download_all_unsynced,
-    sync_documents_for_all_companies,
-    sync_documents_for_ticker,
-    upsert_document_stub,
-)
-
-
-def _bootstrap_now() -> None:
-    bootstrap_directories()
-    init_db()
-    ui.notify("Bootstrap complete", type="positive")
+from config import bootstrap_directories
+from database import connection_scope, init_db
 
 
 def _stats_text() -> str:
-    try:
-        with connection_scope() as con:
-            company_count = con.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
-            doc_count = con.execute("SELECT COUNT(*) FROM vietstock_documents").fetchone()[0]
-            report_count = con.execute("SELECT COUNT(*) FROM annual_reports").fetchone()[0]
-            financial_statement_count = con.execute(
-                "SELECT COUNT(*) FROM financial_statement_reports"
-            ).fetchone()[0]
-            return (
-                f"companies={company_count} | documents={doc_count} | "
-                f"annual_reports={report_count} | "
-                f"financial_statement_reports={financial_statement_count}"
-            )
-    except Exception as exc:
-        return f"Database not ready: {exc}"
-
-
-def _refresh_companies_table(table: ui.table) -> None:
-    table.rows = [{"ticker": t} for t in list_companies()]
-    table.update()
-
-
-def _add_companies(raw_text: str, table: ui.table) -> None:
-    added = 0
-    for token in raw_text.replace(",", " ").split():
-        code = token.strip().upper()
-        if not code:
-            continue
-        ensure_company(code)
-        added += 1
-    _refresh_companies_table(table)
-    ui.notify(f"Added/kept {added} tickers", type="positive")
-
-
-def _sync_stocks_now(stats: ui.label) -> None:
-    n = sync_stocks()
-    stats.set_text(_stats_text())
-    ui.notify(f"Synced {n} stocks", type="positive")
-
-
-def _sync_models_now(stats: ui.label) -> None:
-    n = sync_financial_models()
-    stats.set_text(_stats_text())
-    ui.notify(f"Synced {n} financial model rows", type="positive")
-
-
-def _sync_statements_now(stats: ui.label, start_year: int, end_year: int) -> None:
-    result = sync_financial_statements_all(start_year=start_year, end_year=end_year)
-    stats.set_text(_stats_text())
-    ui.notify(
-        (
-            f"Statements sync: rows={result['rows']} "
-            f"tickers_ok={result['tickers_done']} failed={result['tickers_failed']}"
-        ),
-        type="positive" if result["tickers_failed"] == 0 else "warning",
+    with connection_scope() as con:
+        row = con.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM companies) AS companies,
+                (SELECT COUNT(*) FROM vietstock_documents) AS documents,
+                (SELECT COUNT(*) FROM annual_reports) AS annual_reports,
+                (SELECT COUNT(*) FROM financial_statement_reports) AS financial_statement_reports,
+                (SELECT COUNT(*) FROM financial_statements) AS financial_statement_rows
+            """
+        ).fetchone()
+    if not row:
+        return "No data"
+    return (
+        f"companies={int(row[0] or 0)} | "
+        f"documents={int(row[1] or 0)} | "
+        f"annual_reports={int(row[2] or 0)} | "
+        f"financial_statement_reports={int(row[3] or 0)} | "
+        f"financial_statement_rows={int(row[4] or 0)}"
     )
 
 
-def _sync_ratios_now(stats: ui.label, start_year: int, end_year: int) -> None:
-    result = sync_financial_ratios_all(start_year=start_year, end_year=end_year)
-    stats.set_text(_stats_text())
-    ui.notify(
-        (
-            f"Ratios sync: rows={result['rows']} "
-            f"tickers_ok={result['tickers_done']} failed={result['tickers_failed']}"
-        ),
-        type="positive" if result["tickers_failed"] == 0 else "warning",
-    )
-
-
-def _queue_stub_document(
-    ticker: str,
-    doc_type: str,
-    title: str,
-    file_url: str,
-    doc_id: str,
-) -> None:
-    doc_id_int = int(doc_id.strip())
-    upsert_document_stub(
-        doc_id=doc_id_int,
-        ticker=ticker,
-        doc_type=doc_type,
-        title=title,
-        file_url=file_url,
-    )
-    ui.notify(f"Queued document id={doc_id_int}", type="positive")
-
-
-def _download_unsynced_now(stats: ui.label, use_llm: bool) -> None:
-    result = download_all_unsynced(limit=200, use_llm_selection=use_llm)
-    stats.set_text(_stats_text())
-    ui.notify(
-        f"Downloaded {result['done']}/{result['total']} (failed={result['failed']})",
-        type="positive" if result["failed"] == 0 else "warning",
-    )
-
-
-def _sync_docs_one_now(stats: ui.label, ticker: str, doc_type: str) -> None:
-    n = sync_documents_for_ticker(ticker=ticker, doc_type=doc_type)
-    stats.set_text(_stats_text())
-    ui.notify(f"Synced {n} document rows for {ticker.upper()}", type="positive")
-
-
-def _sync_docs_all_now(stats: ui.label, doc_type: str) -> None:
-    result = sync_documents_for_all_companies(doc_type=doc_type)
-    stats.set_text(_stats_text())
-    ui.notify(
-        (
-            f"Listings sync done: rows={result['rows']} "
-            f"tickers_ok={result['tickers_done']} failed={result['tickers_failed']}"
-        ),
-        type="positive" if result["tickers_failed"] == 0 else "warning",
-    )
-
-
-def _parse_ticker_filter(raw_text: str) -> list[str] | None:
-    tickers = [token.strip().upper() for token in raw_text.replace(",", " ").split() if token.strip()]
-    return tickers or None
-
-
-def _load_annual_now(stats: ui.label, ticker_filter: str, start_year: int, end_year: int) -> None:
-    result = load_annual_reports_from_markdown(
-        tickers=_parse_ticker_filter(ticker_filter),
-        start_year=start_year,
-        end_year=end_year,
-    )
-    stats.set_text(_stats_text())
-    ui.notify(
-        (
-            f"Annual load: loaded={result['loaded']} pairs={result['pairs']} "
-            f"failed={result['failed']} skipped={result['skipped']} filtered={result['filtered_out']}"
-        ),
-        type="positive" if result["failed"] == 0 else "warning",
-    )
-
-
-def _load_financial_statement_now(
-    stats: ui.label,
-    ticker_filter: str,
-    start_year: int,
-    end_year: int,
-) -> None:
-    result = load_financial_statement_reports_from_markdown(
-        tickers=_parse_ticker_filter(ticker_filter),
-        start_year=start_year,
-        end_year=end_year,
-    )
-    stats.set_text(_stats_text())
-    ui.notify(
-        (
-            f"Financial statement load: loaded={result['loaded']} pairs={result['pairs']} "
-            f"failed={result['failed']} skipped={result['skipped']} filtered={result['filtered_out']}"
-        ),
-        type="positive" if result["failed"] == 0 else "warning",
-    )
-
-
-def _parse_year(raw_text: str) -> int | None:
-    text = raw_text.strip()
+def _safe_select_sql(raw_sql: str) -> tuple[bool, str]:
+    text = (raw_sql or "").strip()
     if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        return None
+        return False, "Empty SQL"
+
+    lowered = text.lower()
+    if ";" in text[:-1]:
+        return False, "Only one SQL statement is allowed"
+
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        return False, "Only SELECT/WITH queries are allowed"
+
+    forbidden = re.compile(
+        r"\\b(insert|update|delete|drop|alter|create|replace|truncate|attach|detach|copy|call|pragma)\\b",
+        re.IGNORECASE,
+    )
+    if forbidden.search(text):
+        return False, "Potentially destructive SQL keyword detected"
+
+    return True, text.rstrip(";")
 
 
-def _query_output_rows(
-    dataset: str,
-    ticker_filter: str,
-    year_filter: int | None,
-    limit: int,
-) -> list[dict[str, str]]:
-    ticker = ticker_filter.strip().upper()
-
-    if dataset == "all":
-        sql = """
-            SELECT dataset, ticker, year, source_file, content
-            FROM (
-                SELECT 'annual' AS dataset, ticker, year, source_file, content
-                FROM annual_reports
-                UNION ALL
-                SELECT 'financial_statement' AS dataset, ticker, year, source_file, content
-                FROM financial_statement_reports
-            ) q
-            WHERE (? = '' OR ticker = ?)
-              AND (? IS NULL OR year = ?)
-            ORDER BY year DESC, ticker
-            LIMIT ?
-        """
-        params: list[object] = [ticker, ticker, year_filter, year_filter, limit]
-    else:
-        table = "annual_reports" if dataset == "annual" else "financial_statement_reports"
-        sql = f"""
-            SELECT ? AS dataset, ticker, year, source_file, content
-            FROM {table}
-            WHERE (? = '' OR ticker = ?)
-              AND (? IS NULL OR year = ?)
-            ORDER BY year DESC, ticker
-            LIMIT ?
-        """
-        params = [dataset, ticker, ticker, year_filter, year_filter, limit]
+def _run_query(sql: str, limit: int) -> int:
+    ok, safe_sql = _safe_select_sql(sql)
+    if not ok:
+        print(f"Query blocked: {safe_sql}")
+        return 2
 
     with connection_scope() as con:
-        rows = con.execute(sql, params).fetchall()
-
-    out: list[dict[str, str]] = []
-    for r in rows:
-        full_content = str(r[4] or "")
-        out.append(
-            {
-                "dataset": str(r[0]),
-                "ticker": str(r[1]),
-                "year": str(r[2]),
-                "source_file": str(r[3]),
-                "preview": full_content[:280].replace("\n", " "),
-                "full_content": full_content,
-            }
-        )
-    return out
+        df = con.execute(safe_sql).fetchdf()
+    if limit > 0:
+        df = df.head(limit)
+    print(df.to_string(index=False))
+    return 0
 
 
-def _load_outputs_now(
-    table: ui.table,
-    dataset: str,
-    ticker_filter: str,
-    year_text: str,
-    limit: int,
-) -> None:
-    year_filter = _parse_year(year_text)
-    if year_text.strip() and year_filter is None:
-        ui.notify("Year filter must be a number", type="warning")
-        return
+def _open_marimo() -> int:
+    app_file = Path(__file__).resolve().parent / "marimo_app.py"
+    result = subprocess.run(["marimo", "edit", str(app_file)], check=False)
+    return int(result.returncode)
 
-    rows = _query_output_rows(
-        dataset=dataset,
-        ticker_filter=ticker_filter,
-        year_filter=year_filter,
-        limit=max(1, min(limit, 1000)),
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="main",
+        description="CLI entrypoint for annual_report. Defaults to opening marimo app.",
     )
-    table.rows = rows
-    table.selected = []
-    table.update()
-    ui.notify(f"Loaded {len(rows)} output rows", type="positive")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="marimo",
+        choices=["marimo", "stats", "query", "init"],
+        help="Action to run.",
+    )
+    parser.add_argument(
+        "--sql",
+        default="",
+        help="SQL text for the query command.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Row cap when printing query results.",
+    )
+    return parser
 
 
-def _show_selected_output(table: ui.table, preview_area: ui.textarea) -> None:
-    selected = table.selected or []
-    if not selected:
-        ui.notify("Select one output row first", type="warning")
-        return
-    row = selected[0]
-    preview_area.value = str(row.get("full_content") or "")
-    preview_area.update()
+def main() -> int:
+    parser = _build_parser()
+    args = parser.parse_args()
 
-
-def build_ui() -> None:
-    ui.page_title("Annual Report Intelligence Platform")
-
-    with ui.column().classes("w-full max-w-4xl mx-auto p-6 gap-4"):
-        ui.label("Annual Report Intelligence Platform").classes("text-3xl font-bold")
-        ui.label("Rebuild foundation is running.").classes("text-gray-600")
-
-        with ui.card().classes("w-full"):
-            ui.label("Phase 0 Controls").classes("text-lg font-semibold")
-            with ui.row().classes("items-center gap-2"):
-                ui.button("Bootstrap directories + DB", on_click=_bootstrap_now)
-                ui.button("Refresh stats", on_click=lambda: stats.set_text(_stats_text()))
-
-            stats = ui.label(_stats_text()).classes("text-sm text-gray-700")
-            ui.label(f"DB path: {DB_PATH}").classes("text-xs text-gray-500")
-            ui.label(
-                f"Last rendered: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            ).classes("text-xs text-gray-500")
-
-        with ui.card().classes("w-full"):
-            ui.label("Phase 1 - Company Registry").classes("text-lg font-semibold")
-            company_input = ui.input("Tickers (space/comma separated)")
-            company_input.props("clearable")
-
-            company_table = ui.table(
-                columns=[
-                    {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"}
-                ],
-                rows=[{"ticker": t} for t in list_companies()],
-                row_key="ticker",
-            ).classes("w-full")
-
-            with ui.row().classes("gap-2"):
-                ui.button(
-                    "Add Tickers",
-                    on_click=lambda: _add_companies(company_input.value or "", company_table),
-                )
-
-                ui.button(
-                    "Delete Selected",
-                    on_click=lambda: (
-                        [delete_company(str(r["ticker"])) for r in (company_table.selected or [])],
-                        _refresh_companies_table(company_table),
-                    ),
-                )
-
-                ui.button(
-                    "Sync Stocks from VNDirect",
-                    on_click=lambda: _sync_stocks_now(stats),
-                )
-
-            company_table.props("selection=multiple")
-
-        with ui.card().classes("w-full"):
-            ui.label("Phase 1 - Financial Data Sync").classes("text-lg font-semibold")
-
-            with ui.row().classes("gap-2"):
-                start_year = ui.number("Start Year", value=DEFAULT_START_YEAR, step=1).classes("w-40")
-                end_year = ui.number("End Year", value=DEFAULT_END_YEAR, step=1).classes("w-40")
-
-            with ui.row().classes("gap-2"):
-                ui.button("Sync Financial Models", on_click=lambda: _sync_models_now(stats))
-                ui.button(
-                    "Sync Financial Statements (All Companies)",
-                    on_click=lambda: _sync_statements_now(
-                        stats,
-                        int(start_year.value or DEFAULT_START_YEAR),
-                        int(end_year.value or DEFAULT_END_YEAR),
-                    ),
-                )
-                ui.button(
-                    "Sync Financial Ratios (All Companies)",
-                    on_click=lambda: _sync_ratios_now(
-                        stats,
-                        int(start_year.value or DEFAULT_START_YEAR),
-                        int(end_year.value or DEFAULT_END_YEAR),
-                    ),
-                )
-
-        with ui.card().classes("w-full"):
-            ui.label("Phase 1 - Vietstock Download Prototype").classes("text-lg font-semibold")
-            ui.label(
-                "Use this to queue document URLs and test robust download resolution for PDF/ZIP/RAR inputs."
-            ).classes("text-sm text-gray-600")
-
-            with ui.row().classes("w-full gap-2"):
-                doc_id_input = ui.input("Document ID", value="1").classes("w-32")
-                ticker_input = ui.input("Ticker", value="VNM").classes("w-32")
-                doc_type_input = ui.input("Doc Type", value="2").classes("w-32")
-
-            title_input = ui.input("Title", value="Bao cao thuong nien 2024").classes("w-full")
-            url_input = ui.input("File URL").classes("w-full")
-            use_llm = ui.checkbox("Use LLM for archive candidate selection", value=False)
-
-            with ui.row().classes("gap-2"):
-                ui.button(
-                    "Sync Listings (Ticker)",
-                    on_click=lambda: _sync_docs_one_now(
-                        stats,
-                        ticker=str(ticker_input.value or "VNM"),
-                        doc_type=str(doc_type_input.value or "2"),
-                    ),
-                )
-                ui.button(
-                    "Sync Listings (All Companies)",
-                    on_click=lambda: _sync_docs_all_now(
-                        stats,
-                        doc_type=str(doc_type_input.value or "2"),
-                    ),
-                )
-                ui.button(
-                    "Queue Stub Doc",
-                    on_click=lambda: _queue_stub_document(
-                        ticker=ticker_input.value or "",
-                        doc_type=doc_type_input.value or "2",
-                        title=title_input.value or "",
-                        file_url=url_input.value or "",
-                        doc_id=doc_id_input.value or "1",
-                    ),
-                )
-                ui.button(
-                    "Download Unsynced",
-                    on_click=lambda: _download_unsynced_now(stats, bool(use_llm.value)),
-                )
-
-        with ui.card().classes("w-full"):
-            ui.label("Phase 2 - Markdown Loading MVP").classes("text-lg font-semibold")
-            ui.label(
-                "Load converted markdown from disk into annual_reports and financial_statement_reports with idempotent upserts."
-            ).classes("text-sm text-gray-600")
-
-            with ui.row().classes("w-full gap-2"):
-                loader_tickers = ui.input("Tickers filter (optional)").classes("w-72")
-                loader_start_year = ui.number("Start Year", value=DEFAULT_START_YEAR, step=1).classes("w-40")
-                loader_end_year = ui.number("End Year", value=DEFAULT_END_YEAR, step=1).classes("w-40")
-
-            with ui.row().classes("gap-2"):
-                ui.button(
-                    "Load Annual Markdown",
-                    on_click=lambda: _load_annual_now(
-                        stats,
-                        ticker_filter=str(loader_tickers.value or ""),
-                        start_year=int(loader_start_year.value or DEFAULT_START_YEAR),
-                        end_year=int(loader_end_year.value or DEFAULT_END_YEAR),
-                    ),
-                )
-                ui.button(
-                    "Load Financial Statement Markdown",
-                    on_click=lambda: _load_financial_statement_now(
-                        stats,
-                        ticker_filter=str(loader_tickers.value or ""),
-                        start_year=int(loader_start_year.value or DEFAULT_START_YEAR),
-                        end_year=int(loader_end_year.value or DEFAULT_END_YEAR),
-                    ),
-                )
-
-        with ui.card().classes("w-full"):
-            ui.label("Simple Output Browser").classes("text-lg font-semibold")
-            ui.label(
-                "Browse loaded annual and financial statement outputs by filter, then preview selected content."
-            ).classes("text-sm text-gray-600")
-
-            with ui.row().classes("w-full gap-2 items-end"):
-                dataset_select = ui.select(
-                    options={
-                        "all": "All",
-                        "annual": "Annual",
-                        "financial_statement": "Financial Statement",
-                    },
-                    value="all",
-                    label="Dataset",
-                ).classes("w-52")
-                output_ticker = ui.input("Ticker (optional)").classes("w-40")
-                output_year = ui.input("Year (optional)").classes("w-40")
-                output_limit = ui.number("Limit", value=50, step=1).classes("w-32")
-
-            output_table = ui.table(
-                columns=[
-                    {"name": "dataset", "label": "Dataset", "field": "dataset", "align": "left"},
-                    {"name": "ticker", "label": "Ticker", "field": "ticker", "align": "left"},
-                    {"name": "year", "label": "Year", "field": "year", "align": "left"},
-                    {"name": "source_file", "label": "Source File", "field": "source_file", "align": "left"},
-                    {"name": "preview", "label": "Preview", "field": "preview", "align": "left"},
-                ],
-                rows=[],
-                row_key="source_file",
-            ).classes("w-full")
-            output_table.props("selection=single")
-
-            with ui.row().classes("gap-2"):
-                ui.button(
-                    "Load Outputs",
-                    on_click=lambda: _load_outputs_now(
-                        output_table,
-                        dataset=str(dataset_select.value or "all"),
-                        ticker_filter=str(output_ticker.value or ""),
-                        year_text=str(output_year.value or ""),
-                        limit=int(output_limit.value or 50),
-                    ),
-                )
-                output_preview = ui.textarea("Selected Content").props("readonly autogrow").classes("w-full")
-                ui.button(
-                    "Preview Selected",
-                    on_click=lambda: _show_selected_output(output_table, output_preview),
-                )
-
-
-def main() -> None:
     bootstrap_directories()
     init_db()
-    build_ui()
-    ui.run(title="Annual Report Intelligence Platform", reload=False)
+
+    if args.command == "init":
+        print("Bootstrap complete")
+        print(_stats_text())
+        return 0
+
+    if args.command == "stats":
+        print(_stats_text())
+        return 0
+
+    if args.command == "query":
+        if not args.sql.strip():
+            parser.error("--sql is required for command=query")
+        return _run_query(args.sql, args.limit)
+
+    return _open_marimo()
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    main()
+    sys.exit(main())

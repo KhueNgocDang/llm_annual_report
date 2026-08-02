@@ -6,29 +6,41 @@ This branch is a from-scratch implementation guided by `PRD_UNIFIED.md`.
 
 Default setup installs the lightweight Phase 0 stack.
 
-1. Bootstrap directories and database schema:
+1. Install dependencies:
+
+```bash
+uv sync
+```
+
+2. Bootstrap directories and database schema:
 
 ```bash
 uv run python -m rebuild_init
 ```
 
-2. Start the NiceGUI app shell:
+3. Open the marimo workspace for interactive data extraction:
 
 ```bash
 uv run python -m main
 ```
 
-The app opens on the default NiceGUI local address.
+This opens [marimo_app.py](marimo_app.py) in marimo (`marimo edit`) with parameter cells for:
+- dataset selection (`all`, `annual`, `financial_statement`, `financial_rows`)
+- ticker/year filters
+- optional read-only SQL (`SELECT`/`WITH` only)
+- optional CSV export path
 
-2. Start the Dash frontend:
+The marimo app now also includes a DuckDB chat analyst flow:
+- natural-language question to SQL suggestion
+- schema-aware SQL generation templates
+- optional OpenAI fallback (`enable_llm_fallback`, `force_llm`)
+- safe SQL guardrails before execution
+- automatic line/bar chart rendering for compatible result shapes
+- lightweight chat history for follow-up analysis
 
-```bash
-uv run python -m dash_app
-```
+For OpenAI fallback mode, set `OPENAI_API_KEY` in `.env`. The app reads this key directly from the project `.env` at runtime.
 
-Open http://127.0.0.1:8050 to use the task runner and output explorer dashboard.
-
-3. Run Phase 2 markdown loading from terminal (optional):
+4. Run Phase 2 markdown loading from terminal (optional):
 
 ```bash
 uv run python -m load_reports --dataset all --start-year 2015 --end-year 2025
@@ -54,7 +66,7 @@ uv sync --extra full
   - Environment/config bootstrap
   - Directory bootstrap
   - DuckDB schema initialization
-  - Minimal app shell with health stats
+  - CLI bootstrap and health stats
 
 - Phase 1 ingestion is in progress:
   - Company registry add/delete/list
@@ -76,30 +88,12 @@ uv sync --extra full
   - Lineage tracking in `pipeline_files` with stage keys:
     - `markdown_annual`
     - `markdown_financial_statement`
-  - Ticker/year scoped loads from UI controls
+  - Ticker/year scoped loads from CLI
 
-- Simple output visualization is available in UI:
-  - Dataset/ticker/year output filtering
-  - Table view with source file and content preview
-  - Selected row full-content preview panel
-
-- Dash frontend is available for operations + visualization:
-  - Task Runner tab to execute pipeline actions
-  - Output Explorer tab with table and charts (by year, top tickers)
-  - Financial Statement Explorer tab with curated popular metrics
-
-## Financial Statement Visualization
-
-In Dash, open the `Financial Statement Explorer` tab to:
-
-1. Enter a ticker (for example `VNM`).
-2. Select statement type:
-  - `Balance Sheet (Popular Items)`
-  - `Income Statement (Popular Items)`
-3. Load and visualize curated metrics only (for cleaner UX):
-  - trend chart by metric and year
-  - latest metric snapshot bar chart
-  - summary table with mapped item codes and latest values
+- marimo workspace is available for data retrieval:
+  - output dataset filtering by ticker/year
+  - ad-hoc read-only SQL for deeper extraction
+  - direct CSV export of query results
 
 ## MCP-Friendly SQL Templates
 
