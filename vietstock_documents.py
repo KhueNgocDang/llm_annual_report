@@ -41,6 +41,16 @@ def _financial_statement_title_quality_score(title: str) -> int:
     text = _normalize_vi_text(title or "")
     score = 0
 
+    # Strongly prefer canonical audited financial statement wording.
+    if "bao cao tai chinh" in text:
+        score += 60
+    if "bctc" in text:
+        score += 35
+    if "kiem toan" in text:
+        score += 25
+    if "hop nhat" in text:
+        score += 15
+
     # De-prioritize adjustment/notice style attachments.
     for marker in (
         "dieu chinh",
@@ -49,21 +59,40 @@ def _financial_statement_title_quality_score(title: str) -> int:
         "bo sung",
         "thong bao",
         "phu luc",
+        "cong bo thong tin",
+        "cong van",
     ):
         if marker in text:
-            score -= 20
+            score -= 80
 
-    # Prefer likely full audited financial statements.
-    for marker in (
-        "bao cao tai chinh",
-        "bctc",
-        "hop nhat",
-        "kiem toan",
-    ):
-        if marker in text:
-            score += 4
+    # Notes-only PDFs are usually attachments when a full BCTC exists.
+    if "thuyet minh" in text:
+        score -= 35
 
     return score
+
+
+def _is_preferred_financial_statement_title(title: str) -> bool:
+    """Return whether *title* looks like a full audited financial statement."""
+    text = _normalize_vi_text(title or "")
+    has_report_marker = "bao cao tai chinh" in text or "bctc" in text
+    has_audit_marker = "kiem toan" in text
+    blocked_markers = (
+        "dieu chinh",
+        "dinh chinh",
+        "giai trinh",
+        "bo sung",
+        "thong bao",
+        "phu luc",
+        "cong bo thong tin",
+        "cong van",
+        "thuyet minh",
+    )
+    return (
+        has_report_marker
+        and has_audit_marker
+        and not any(marker in text for marker in blocked_markers)
+    )
 
 
 def _normalize_vi_text(value: str) -> str:

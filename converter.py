@@ -12,6 +12,7 @@ import re
 import signal
 import subprocess
 import time
+import unicodedata
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,8 @@ from database import ensure_company, get_connection
 from vietstock_documents import (
     DOC_TYPE_ANNUAL_REPORT,
     DOC_TYPE_AUDITED_CONSOLIDATED_FS,
+    _financial_statement_title_quality_score,
+    _is_preferred_financial_statement_title,
 )
 
 import shutil
@@ -34,6 +37,37 @@ import shutil
 # ---------------------------------------------------------------------------
 
 _RAW_REPORT_PATTERN = r"^Báo cáo thường niên năm (\d{4})\s*\.pdf$"
+
+
+def _build_marker_single_command() -> list[str]:
+    """Reuse the active repo venv when present; otherwise prefer uv-managed execution."""
+    project_root = Path(__file__).resolve().parent
+    local_marker = project_root / ".venv" / "bin" / "marker_single"
+    active_venv = os.environ.get("VIRTUAL_ENV")
+    if active_venv and Path(active_venv).resolve() == (project_root / ".venv").resolve():
+        if local_marker.exists() and os.access(local_marker, os.X_OK):
+            return [str(local_marker)]
+
+    uv_executable = shutil.which("uv")
+    if uv_executable:
+        return [
+            uv_executable,
+            "run",
+            "--project",
+            str(project_root),
+            "marker_single",
+        ]
+
+    if local_marker.exists() and os.access(local_marker, os.X_OK):
+        return [str(local_marker)]
+
+    global_marker = shutil.which("marker_single")
+    if global_marker:
+        return [global_marker]
+
+    raise FileNotFoundError(
+        "marker_single was not found. Run `uv sync` in the project root to install the repo-managed CLI."
+    )
 
 
 def _job_kind_from_output_dir(output_dir: str | Path) -> str:
@@ -651,6 +685,23 @@ def _find_manual_pdf_candidate(
     return best
 
 
+def _normalize_archive_member_name(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return text.replace("đ", "d")
+
+
+def _pdf_page_count_from_bytes(pdf_bytes: bytes) -> int | None:
+    try:
+        import fitz
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return int(doc.page_count)
+    except Exception:
+        return None
+
+
 def _resolve_source_pdf(
     source_path: str | Path,
     *,
@@ -745,6 +796,12 @@ def _resolve_source_pdf(
         extract_dir = src.parent / "_extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(src, "r") as zf:
+            nested_archive_members = [
+                info
+                for info in zf.infolist()
+                if not info.is_dir()
+                and info.filename.lower().endswith((".zip", ".rar", ".7z"))
+            ]
             pdf_members = [
                 info
                 for info in zf.infolist()
@@ -763,18 +820,46 @@ def _resolve_source_pdf(
             if not primary_members:
                 primary_members = pdf_members
 
-            # Prefer Vietnamese filenames (e.g., "vi" markers), then larger payloads.
-            member = max(
-                primary_members,
-                key=lambda info: (
+            member_rows: list[tuple[tuple[int, int, int, int, int], zipfile.ZipInfo, bytes]] = []
+            for info in primary_members:
+                with zf.open(info) as rf:
+                    pdf_bytes = rf.read()
+                page_count = _pdf_page_count_from_bytes(pdf_bytes) or 0
+                title_score = _financial_statement_title_quality_score(
+                    Path(info.filename).stem
+                )
+                preferred_title = 1 if _is_preferred_financial_statement_title(
+                    Path(info.filename).stem
+                ) else 0
+                rank = (
+                    preferred_title,
+                    title_score,
+                    page_count,
                     _zip_pdf_language_score(info.filename),
                     info.file_size,
-                    -len(info.filename),
-                ),
+                )
+                member_rows.append((rank, info, pdf_bytes))
+
+            member_rows.sort(key=lambda item: item[0], reverse=True)
+            best_rank, member, pdf_bytes = member_rows[0]
+
+            largest_nested_archive = max(
+                (info.file_size for info in nested_archive_members),
+                default=0,
             )
+            if (
+                largest_nested_archive > int(member.file_size * 2)
+                and best_rank[2] <= 3
+                and best_rank[0] == 0
+            ):
+                raise ValueError(
+                    "ZIP contains only short attachment PDFs and a larger nested archive; "
+                    "extract the main report PDF manually before conversion"
+                )
+
             target_pdf = extract_dir / f"{src.stem}.pdf"
-            with zf.open(member) as rf, open(target_pdf, "wb") as wf:
-                wf.write(rf.read())
+            with open(target_pdf, "wb") as wf:
+                wf.write(pdf_bytes)
             return target_pdf
 
     if allow_manual_updated_files:
@@ -871,7 +956,7 @@ def run_job(
     log_path = LOGS_DIR / f"{job_kind}_job_{job_id}.log"
 
     cmd = [
-        "marker_single",
+        *_build_marker_single_command(),
         source_path,
         "--output_dir",
         str(out_dir),
@@ -992,12 +1077,103 @@ def run_job(
         return False
 
 
+def convert_financial_statement_source_to_markdown(
+    source_path: str | Path,
+    *,
+    ticker: str,
+    year: int,
+    output_dir: str | Path | None = None,
+    allow_manual_updated_files: bool = False,
+    force_ocr_override: bool = False,
+    rerun_reason: str | None = None,
+    doc_id: int | None = None,
+    on_heartbeat: Callable[[int], None] | None = None,
+) -> Path:
+    """Convert one known financial-statement source file to markdown."""
+    ticker = str(ticker).upper()
+    year = int(year)
+    source_file = _resolve_source_pdf(
+        source_path,
+        ticker=ticker,
+        year=year,
+        allow_manual_updated_files=allow_manual_updated_files,
+    )
+    out_root = Path(output_dir or FINANCIAL_STATEMENT_MARKDOWN_DIR)
+    out_dir = out_root / ticker
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_id = str(int(doc_id)) if doc_id is not None else "manual"
+    log_path = LOGS_DIR / f"financial_statement_{ticker}_{year}_{log_id}.log"
+
+    cmd = [
+        *_build_marker_single_command(),
+        str(source_file),
+        "--output_dir",
+        str(out_dir),
+    ]
+
+    needs_ocr = _pdf_needs_ocr(str(source_file))
+    should_force_ocr = bool(force_ocr_override) or needs_ocr
+
+    for flag, value in MARKER_EXTRA_ARGS.items():
+        # Keep OCR behavior consistent with conversion jobs.
+        if flag == "force_ocr" and not should_force_ocr:
+            continue
+        if isinstance(value, bool):
+            if value:
+                cmd.append(f"--{flag}")
+        else:
+            cmd.extend([f"--{flag}", str(value)])
+
+    with open(log_path, "w") as log_file:
+        log_file.write(
+            f"=== Financial statement marker conversion: {ticker} {year} (doc_id={log_id}) ===\n"
+        )
+        log_file.write(
+            f"OCR mode: {'force_ocr (manual override)' if force_ocr_override else 'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
+        )
+        if rerun_reason:
+            log_file.write(f"Rerun reason: {rerun_reason}\n")
+        log_file.write(f"Command: {' '.join(cmd)}\n")
+        log_file.write(f"Started: {datetime.now().isoformat()}\n")
+        log_file.write("=" * 60 + "\n\n")
+        log_file.flush()
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        return_code = _wait_with_log_heartbeat(
+            proc,
+            log_file,
+            heartbeat_callback=on_heartbeat,
+        )
+
+        log_file.write(f"\n{'=' * 60}\n")
+        log_file.write(f"Exit code: {return_code}\n")
+        log_file.write(f"Finished: {datetime.now().isoformat()}\n")
+        log_file.flush()
+
+    if return_code != 0:
+        raise RuntimeError(
+            "marker_single failed for financial statement "
+            f"{ticker}-{year}; see {log_path}"
+        )
+
+    return out_dir
+
+
 def convert_financial_statement_to_markdown(
     con: duckdb.DuckDBPyConnection,
     ticker: str,
     year: int,
     output_dir: str | Path | None = None,
     allow_manual_updated_files: bool = False,
+    force_ocr_override: bool = False,
+    rerun_reason: str | None = None,
     on_heartbeat: Callable[[int], None] | None = None,
 ) -> Path:
     """Convert latest synced financial-statement PDF for ticker/year to markdown.
@@ -1025,42 +1201,6 @@ def convert_financial_statement_to_markdown(
             f"No synced financial statement PDF found for {str(ticker).upper()}-{int(year)}"
         )
 
-    def _financial_statement_title_quality_score(title: str | None) -> int:
-        text = str(title or "").lower()
-
-        score = 0
-        # De-prioritize adjustment/notice style files which are often partial docs.
-        for marker in (
-            "điều chỉnh",
-            "dieu chinh",
-            "đính chính",
-            "dinh chinh",
-            "giải trình",
-            "giai trinh",
-            "bổ sung",
-            "bo sung",
-            "thong bao",
-            "thông báo",
-            "phu luc",
-            "phụ lục",
-        ):
-            if marker in text:
-                score -= 20
-
-        # Prefer likely full audited financial statement titles.
-        for marker in (
-            "bao cao tai chinh",
-            "bctc",
-            "hop nhat",
-            "hợp nhất",
-            "kiem toan",
-            "kiểm toán",
-        ):
-            if marker in text:
-                score += 4
-
-        return score
-
     best_candidate: tuple[int, int, int, int, int, str, Path] | None = None
     best_doc_id: int | None = None
 
@@ -1081,18 +1221,17 @@ def convert_financial_statement_to_markdown(
         except Exception:
             size = 0
 
-        title_score = _financial_statement_title_quality_score(candidate_title)
-        has_adjustment_marker = 1 if title_score < 0 else 0
+        title_score = _financial_statement_title_quality_score(
+            str(candidate_title or "")
+        )
+        preferred_title = 1 if _is_preferred_financial_statement_title(
+            str(candidate_title or "")
+        ) else 0
 
-        # Ranking priority:
-        # 1) non-adjustment titles
-        # 2) larger resolved PDF size
-        # 3) stronger full-report title signals
-        # 4) newer row order from SQL (earlier idx)
         rank = (
-            -has_adjustment_marker,
-            size,
+            preferred_title,
             title_score,
+            size,
             -idx,
             int(candidate_id),
             str(candidate_source_path),
@@ -1107,73 +1246,17 @@ def convert_financial_statement_to_markdown(
             f"No readable financial statement source file found for {str(ticker).upper()}-{int(year)}"
         )
 
-    doc_id = best_doc_id
-    source_file = best_candidate[-1]
-
-    out_root = Path(output_dir or FINANCIAL_STATEMENT_MARKDOWN_DIR)
-    out_dir = out_root / str(ticker).upper()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = LOGS_DIR / (
-        f"financial_statement_{str(ticker).upper()}_{int(year)}_{int(doc_id)}.log"
+    return convert_financial_statement_source_to_markdown(
+        best_candidate[-1],
+        ticker=str(ticker).upper(),
+        year=int(year),
+        output_dir=output_dir,
+        allow_manual_updated_files=allow_manual_updated_files,
+        force_ocr_override=force_ocr_override,
+        rerun_reason=rerun_reason,
+        doc_id=best_doc_id,
+        on_heartbeat=on_heartbeat,
     )
-
-    cmd = [
-        "marker_single",
-        str(source_file),
-        "--output_dir",
-        str(out_dir),
-    ]
-
-    needs_ocr = _pdf_needs_ocr(str(source_file))
-
-    for flag, value in MARKER_EXTRA_ARGS.items():
-        # Keep OCR behavior consistent with conversion jobs.
-        if flag == "force_ocr" and not needs_ocr:
-            continue
-        if isinstance(value, bool):
-            if value:
-                cmd.append(f"--{flag}")
-        else:
-            cmd.extend([f"--{flag}", str(value)])
-
-    with open(log_path, "w") as log_file:
-        log_file.write(
-            f"=== Financial statement marker conversion: {str(ticker).upper()} {int(year)} (doc_id={int(doc_id)}) ===\n"
-        )
-        log_file.write(
-            f"OCR mode: {'force_ocr (image-based PDF)' if needs_ocr else 'text extraction (text-based PDF)'}\n"
-        )
-        log_file.write(f"Command: {' '.join(cmd)}\n")
-        log_file.write(f"Started: {datetime.now().isoformat()}\n")
-        log_file.write("=" * 60 + "\n\n")
-        log_file.flush()
-
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        return_code = _wait_with_log_heartbeat(
-            proc,
-            log_file,
-            heartbeat_callback=on_heartbeat,
-        )
-
-        log_file.write(f"\n{'=' * 60}\n")
-        log_file.write(f"Exit code: {return_code}\n")
-        log_file.write(f"Finished: {datetime.now().isoformat()}\n")
-        log_file.flush()
-
-    if return_code != 0:
-        raise RuntimeError(
-            "marker_single failed for financial statement "
-            f"{str(ticker).upper()}-{int(year)}; see {log_path}"
-        )
-
-    return out_dir
 
 
 # ---------------------------------------------------------------------------
