@@ -5,6 +5,7 @@ import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import duckdb
 import pandas as pd
@@ -15,6 +16,7 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 )
+VIETSTOCK_STATIC_DATA_BASE = "https://static2.vietstock.vn/data/"
 
 DOC_TYPE_ANNUAL_REPORT = "2"
 DOC_TYPE_AUDITED_CONSOLIDATED_FS = "1"
@@ -102,6 +104,84 @@ def _normalize_vi_text(value: str) -> str:
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     # Handle Vietnamese specific letter after accent stripping.
     return text.replace("đ", "d")
+
+
+def _normalize_document_download_url(file_url: str) -> str:
+    """Convert stored Vietstock file paths into absolute download URLs."""
+    value = str(file_url or "").strip()
+    if not value:
+        return value
+    if value.startswith(("http://", "https://")):
+        return value
+
+    normalized = value.lstrip("/")
+    if normalized.lower().startswith("data/"):
+        normalized = normalized[5:]
+    return VIETSTOCK_STATIC_DATA_BASE + normalized
+
+
+def _infer_download_url_candidates(
+    ticker: str,
+    title: str,
+    file_url: str,
+) -> list[str]:
+    """Return candidate absolute URLs for Vietstock document downloads."""
+    normalized_url = _normalize_document_download_url(file_url)
+    candidates = [normalized_url]
+
+    parsed = urlparse(normalized_url)
+    path = parsed.path.rstrip("/")
+    if Path(path).suffix:
+        return candidates
+
+    year = _extract_year_from_title(str(title or ""))
+    if year is None:
+        return candidates
+
+    ticker_u = str(ticker or "").strip().upper()
+    if not ticker_u:
+        return candidates
+
+    base_name = f"{ticker_u}_Baocaotaichinh_{year}_Kiemtoan"
+    title_text = _normalize_vi_text(title or "")
+    name_candidates = [base_name]
+    if "hop nhat" in title_text:
+        name_candidates.insert(0, f"{base_name}_Hopnhat")
+
+    base_url = normalized_url.rstrip("/") + "/"
+    for stem in name_candidates:
+        for ext in (".pdf", ".zip", ".rar", ".7z"):
+            candidate = base_url + stem + ext
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+    return candidates
+
+
+def _resolve_download_url(
+    ticker: str,
+    title: str,
+    file_url: str,
+) -> str:
+    """Resolve stored Vietstock download metadata to a concrete downloadable URL."""
+    candidates = _infer_download_url_candidates(ticker, title, file_url)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    for candidate in candidates[1:]:
+        try:
+            resp = requests.head(
+                candidate,
+                headers={"User-Agent": USER_AGENT},
+                allow_redirects=True,
+                timeout=20,
+            )
+        except Exception:
+            continue
+        if resp.ok:
+            return candidate
+
+    return candidates[0]
 
 
 def _is_audited_annual_doc(doc: dict) -> bool:
@@ -520,6 +600,11 @@ def download_document_to_raw(
         raise ValueError(f"Document {doc_id} not found in database.")
 
     ticker, file_url, title = row
+    file_url = _resolve_download_url(
+        str(ticker or ""),
+        str(title or ""),
+        str(file_url or ""),
+    )
 
     if not file_url:
         raise ValueError(f"Document {doc_id} has no file URL.")
@@ -555,8 +640,6 @@ def download_document_to_raw(
     ext = _MIME_TO_EXT.get(content_type)
     if ext is None:
         # Fall back to URL extension
-        from urllib.parse import urlparse
-
         url_path = urlparse(file_url).path.lower()
         for known_ext in (
             ".zip",
