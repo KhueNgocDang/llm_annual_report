@@ -7,6 +7,7 @@ import argparse
 import csv
 import os
 import shutil
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +24,79 @@ from vietstock_documents import (
 )
 
 RESULTS_DIR = Path("data/output")
+_FINANCIAL_STATEMENT_SECTION_MARKERS = (
+    "bang can doi ke toan",
+    "bao cao ket qua hoat dong kinh doanh",
+    "bao cao luu chuyen tien te",
+    "luu chuyen tien te",
+    "thuyet minh bao cao tai chinh",
+)
+_DISCLOSURE_MARKERS = (
+    "cong bo thong tin",
+    "nghi quyet",
+    "kinh gui",
+    "uy ban chung khoan",
+    "so giao dich chung khoan",
+)
+_MIN_FINANCIAL_STATEMENT_TOKEN_COUNT = 3000
+
+
+def _normalize_vi_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return text.replace("đ", "d")
+
+
+def _apply_financial_statement_content_checks(
+    row: dict[str, str | int | float | bool],
+    content: str,
+) -> dict[str, str | int | float | bool]:
+    normalized = _normalize_vi_text(content)
+    matched_sections = [
+        marker
+        for marker in _FINANCIAL_STATEMENT_SECTION_MARKERS
+        if marker in normalized
+    ]
+    matched_disclosures = [
+        marker for marker in _DISCLOSURE_MARKERS if marker in normalized
+    ]
+    token_count = int(row["token_count"])
+
+    if matched_sections:
+        row["financial_statement_section_count"] = len(matched_sections)
+        row["financial_statement_disclosure_marker_count"] = len(matched_disclosures)
+        return row
+
+    if token_count >= _MIN_FINANCIAL_STATEMENT_TOKEN_COUNT and not matched_disclosures:
+        row["financial_statement_section_count"] = 0
+        row["financial_statement_disclosure_marker_count"] = 0
+        return row
+
+    reasons = [
+        part
+        for part in str(row.get("suspicious_reason") or "").split(",")
+        if part
+    ]
+    if "non_financial_statement_content" not in reasons:
+        reasons.append("non_financial_statement_content")
+
+    evidence_parts = [str(row.get("quality_evidence") or "").strip()]
+    evidence_parts.append(
+        "content_check="
+        f"sections={len(matched_sections)} disclosures={len(matched_disclosures)} tokens={token_count}"
+    )
+    if matched_disclosures:
+        evidence_parts.append("disclosure_markers=" + ",".join(matched_disclosures[:5]))
+
+    row["quality_status"] = "fail"
+    row["suspicious"] = True
+    row["suspicious_reason"] = ",".join(reasons)
+    row["quality_evidence"] = " || ".join(part for part in evidence_parts if part)
+    row["suspicious_score"] = max(float(row["suspicious_score"]), 0.95)
+    row["financial_statement_section_count"] = len(matched_sections)
+    row["financial_statement_disclosure_marker_count"] = len(matched_disclosures)
+    return row
 
 
 def _cleanup_year_outputs(ticker: str, year: int) -> list[str]:
@@ -101,11 +175,12 @@ def _score_entries(
             content,
             suspicious_score_threshold=suspicious_score_threshold,
         )
+        row = {
+            **entry,
+            **quality.to_dict(),
+        }
         rows.append(
-            {
-                **entry,
-                **quality.to_dict(),
-            }
+            _apply_financial_statement_content_checks(row, content)
         )
 
     status_rank = {"fail": 0, "warning": 1, "pass": 2}
@@ -144,6 +219,8 @@ def _write_audit_csv(
         "isolated_diacritic_token_count",
         "garbled_vietnamese_token_count",
         "garbled_vietnamese_token_ratio",
+        "financial_statement_section_count",
+        "financial_statement_disclosure_marker_count",
         "affected_line_count",
         "affected_line_ratio",
         "affected_region_count",
