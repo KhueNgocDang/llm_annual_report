@@ -230,9 +230,38 @@ def get_batch_output_map(client: OpenAI, batch_id: str) -> dict[str, str]:
     if not output_file_id:
         raise RuntimeError(f"Batch {batch_id} completed but has no output file")
 
+    parsed = get_batch_output_details(client, batch_id)
+    results = parsed["results"]
+    failures = parsed["failures"]
+
+    if failures:
+        raise RuntimeError("Batch request failures: " + " | ".join(failures)[:4000])
+
+    return results
+
+
+def get_batch_output_details(client: OpenAI, batch_id: str) -> dict[str, Any]:
+    """Fetch completed batch outputs with success + failure details.
+
+    Returns:
+        {
+            "results": dict[custom_id, raw_json_content],
+            "failures": list[str],
+            "raw_failures": list[{"custom_id": str, "status_code": int, "body": Any}],
+        }
+    """
+    batch = client.batches.retrieve(batch_id)
+    if str(batch.status) != "completed":
+        raise RuntimeError(f"Batch {batch_id} is not completed (status={batch.status})")
+
+    output_file_id = getattr(batch, "output_file_id", None)
+    if not output_file_id:
+        raise RuntimeError(f"Batch {batch_id} completed but has no output file")
+
     output_text = _read_file_text(client, str(output_file_id))
     results: dict[str, str] = {}
     failures: list[str] = []
+    raw_failures: list[dict[str, Any]] = []
 
     for raw_line in output_text.splitlines():
         line = raw_line.strip()
@@ -248,6 +277,13 @@ def get_batch_output_map(client: OpenAI, batch_id: str) -> dict[str, str]:
             failures.append(
                 f"{custom_id}: status={status_code} body={json.dumps(body, ensure_ascii=False)[:500]}"
             )
+            raw_failures.append(
+                {
+                    "custom_id": custom_id,
+                    "status_code": status_code,
+                    "body": body,
+                }
+            )
             continue
 
         choices = body.get("choices") or []
@@ -255,7 +291,8 @@ def get_batch_output_map(client: OpenAI, batch_id: str) -> dict[str, str]:
         content = (message or {}).get("content") or ""
         results[custom_id] = str(content)
 
-    if failures:
-        raise RuntimeError("Batch request failures: " + " | ".join(failures)[:4000])
-
-    return results
+    return {
+        "results": results,
+        "failures": failures,
+        "raw_failures": raw_failures,
+    }

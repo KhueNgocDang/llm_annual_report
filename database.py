@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS document_embeddings (
     chunk_index   INTEGER NOT NULL,
     chunk_text    VARCHAR NOT NULL,
     token_count   INTEGER,
+    chunk_metadata_json VARCHAR,
     embedding     FLOAT[],
     model         VARCHAR,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -165,6 +166,7 @@ CREATE TABLE IF NOT EXISTS financial_statement_document_embeddings (
     chunk_index INTEGER NOT NULL,
     chunk_text  VARCHAR NOT NULL,
     token_count INTEGER,
+    chunk_metadata_json VARCHAR,
     embedding   FLOAT[],
     model       VARCHAR,
     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -172,6 +174,24 @@ CREATE TABLE IF NOT EXISTS financial_statement_document_embeddings (
 );
 
 CREATE SEQUENCE IF NOT EXISTS financial_statement_audit_results_id_seq START 1;
+CREATE SEQUENCE IF NOT EXISTS financial_statement_audit_jobs_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS financial_statement_audit_jobs (
+    id                 INTEGER PRIMARY KEY DEFAULT nextval('financial_statement_audit_jobs_id_seq'),
+    ticker             VARCHAR NOT NULL,
+    year               INTEGER NOT NULL,
+    status             VARCHAR NOT NULL DEFAULT 'pending',
+    model              VARCHAR NOT NULL,
+    top_k              INTEGER,
+    batch_id           VARCHAR,
+    batch_submitted_at TIMESTAMP,
+    batch_checked_at   TIMESTAMP,
+    started_at         TIMESTAMP,
+    completed_at       TIMESTAMP,
+    error_message      VARCHAR,
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (ticker, year, model)
+);
 
 CREATE TABLE IF NOT EXISTS financial_statement_audit_results (
     id                    INTEGER PRIMARY KEY DEFAULT nextval('financial_statement_audit_results_id_seq'),
@@ -462,6 +482,8 @@ _MIGRATION_SQL = [
     "ALTER TABLE reference_embeddings ADD COLUMN IF NOT EXISTS dimensions INTEGER",
     "ALTER TABLE reference_retrieval_logs ADD COLUMN IF NOT EXISTS embedding_model VARCHAR",
     "ALTER TABLE document_embeddings ADD COLUMN IF NOT EXISTS model VARCHAR",
+    "ALTER TABLE document_embeddings ADD COLUMN IF NOT EXISTS chunk_metadata_json VARCHAR",
+    "ALTER TABLE financial_statement_document_embeddings ADD COLUMN IF NOT EXISTS chunk_metadata_json VARCHAR",
     "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS top_k INTEGER",
     "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS categories_done INTEGER",
     "ALTER TABLE inference_jobs ADD COLUMN IF NOT EXISTS categories_total INTEGER",
@@ -746,6 +768,44 @@ def ensure_company(con: duckdb.DuckDBPyConnection, ticker: str) -> None:
         "INSERT INTO companies (ticker) VALUES (?) ON CONFLICT DO NOTHING",
         [ticker.upper()],
     )
+
+
+def sync_companies_from_stocks(
+    con: duckdb.DuckDBPyConnection,
+    exchanges: list[str] | None = None,
+) -> dict[str, int]:
+    """Copy tickers from ``stocks`` into ``companies`` and report the delta."""
+    selected_exchanges = [exchange.upper() for exchange in (exchanges or []) if exchange]
+    conditions = ["code IS NOT NULL"]
+    params: list[str] = []
+
+    if selected_exchanges:
+        placeholders = ", ".join("?" for _ in selected_exchanges)
+        conditions.append(f"floor IN ({placeholders})")
+        params.extend(selected_exchanges)
+
+    where_clause = " AND ".join(conditions)
+    matched = con.execute(
+        f"SELECT COUNT(DISTINCT UPPER(code)) FROM stocks WHERE {where_clause}",
+        params,
+    ).fetchone()[0]
+    before = con.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+
+    con.execute(
+        "INSERT INTO companies (ticker) "
+        f"SELECT DISTINCT UPPER(code) FROM stocks WHERE {where_clause} "
+        "ON CONFLICT DO NOTHING",
+        params,
+    )
+
+    after = con.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+    added = after - before
+    total = int(matched or 0)
+    return {
+        "matched": total,
+        "added": added,
+        "existing": total - added,
+    }
 
 
 def delete_company(

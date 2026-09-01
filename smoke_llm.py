@@ -9,6 +9,10 @@ from company_history import sync_company_history, sync_company_history_many
 from config import MARKDOWN_DIR, OUTPUT_DIR, ensure_env_loaded
 from database import get_connection, init_db
 from llm_embeddings import embed_all_reports, embed_report
+from llm_financial_statement_audit import (
+    create_financial_statement_audit_jobs,
+    extract_financial_statement_audit_info,
+)
 from llm_governance import create_governance_jobs, extract_governance
 from llm_inference import create_inference_jobs, infer_report
 from llm_proper_vn import create_proper_vn_jobs, infer_proper_vn_report
@@ -60,6 +64,9 @@ def cmd_create_jobs(args: argparse.Namespace) -> None:
             "governance_jobs": create_governance_jobs(
                 con, tickers=args.tickers, years=args.years, replace=args.replace
             ),
+            "financial_statement_audit_jobs": create_financial_statement_audit_jobs(
+                con, tickers=args.tickers, years=args.years, replace=args.replace
+            ),
         }
         print(json.dumps(result, indent=2, ensure_ascii=False))
     finally:
@@ -91,6 +98,13 @@ def cmd_infer_one(args: argparse.Namespace) -> None:
             replace=args.replace,
             inference_model=args.model,
         )
+        financial_statement_audit = extract_financial_statement_audit_info(
+            args.ticker,
+            args.year,
+            con=con,
+            replace=args.replace,
+            inference_model=args.model,
+        )
         print(
             json.dumps(
                 {
@@ -100,6 +114,7 @@ def cmd_infer_one(args: argparse.Namespace) -> None:
                     "edc_categories": edc_count,
                     "proper_vn": proper,
                     "governance_items": gov_count,
+                    "financial_statement_audit": financial_statement_audit,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -206,7 +221,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_infer = sub.add_parser(
         "infer-one",
-        help="Run one ticker-year inference for EDC, PROPER-VN, and governance",
+        help="Run one ticker-year inference for EDC, PROPER-VN, governance, and financial-statement audit",
     )
     p_infer.add_argument("--ticker", required=True)
     p_infer.add_argument("--year", required=True, type=int)

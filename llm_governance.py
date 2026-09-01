@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 
 import duckdb
 
@@ -42,6 +43,7 @@ from config import (
 )
 from database import ensure_vss_loaded, get_connection
 from embedder import _get_client, get_embeddings
+from financial_statement_chunk_metadata import parse_chunk_metadata
 from hyde_retrieval import build_hyde2_embedding, precompute_hyde2_embeddings
 from llm_batch_api import (
     get_batch_output_map,
@@ -62,6 +64,139 @@ MAX_PROMPT_CONTENT_TOKENS = 120000
 GOV_RESULTS_TABLE = "governance_results"
 GOV_RESULTS_WRITE_TABLE = "governance_results_hyde2"
 GOVERNANCE_ITEMS = get_task_items("governance")
+
+# Governance items that should retrieve context from financial statements.
+_FS_SOURCE_GOV_ITEMS: set[str] = {
+    "GOV_DIRECTORY",
+    "GOV_EXECUTIVE",
+    "GOV_SUPERVISORY",
+    "GOV_AUDIT",
+}
+
+_FS_GOV_ITEM_SUFFIX = "_FS"
+_FS_GOV_ITEM_CODES: dict[str, str] = {
+    "GOV_DIRECTORY": "GOV_DIRECTORY_FS",
+    "GOV_EXECUTIVE": "GOV_EXECUTIVE_FS",
+    "GOV_SUPERVISORY": "GOV_SUPERVISORY_FS",
+}
+
+
+def _get_governance_result_item_code(item_code: str, source_table: str) -> str:
+    if source_table == "financial_statement_document_embeddings":
+        return _FS_GOV_ITEM_CODES.get(item_code, item_code)
+    return item_code
+
+
+def _governance_item_code_for_source(item_code: str, source_table: str) -> str:
+    return _get_governance_result_item_code(item_code, source_table)
+
+_LEADERSHIP_ROSTER_ITEMS: set[str] = {
+    "GOV_DIRECTORY",
+    "GOV_EXECUTIVE",
+    "GOV_SUPERVISORY",
+}
+
+_LEADERSHIP_SECTION_ANCHORS: list[str] = [
+    "thông tin chung",
+    "thong tin chung",
+    "hội đồng quản trị",
+    "hoi dong quan tri",
+    "hđqt",
+    "hdqt",
+    "ban tổng giám đốc",
+    "ban tong giam doc",
+    "ban điều hành",
+    "ban dieu hanh",
+    "ban kiểm soát",
+    "ban kiem soat",
+    "ban kièm soát",
+    "thành viên hội đồng quản trị, ban kiểm soát và ban tổng giám đốc",
+    "thanh vien hoi dong quan tri, ban kiem soat va ban tong giam doc",
+]
+
+_EMBED_METADATA_COLUMN_CACHE: dict[str, bool] = {}
+
+_GOV_METADATA_TAGS: dict[str, set[str]] = {
+    "GOV_DIRECTORY": {"board_of_directors", "leadership_overview"},
+    "GOV_EXECUTIVE": {"executive_board", "leadership_overview"},
+    "GOV_SUPERVISORY": {"supervisory_board", "leadership_overview"},
+    "GOV_AUDIT": {"audit_report"},
+    "GOV_SHAREHOLDERS": {"shareholders"},
+}
+
+_GOV_CONFLICT_TAGS: dict[str, set[str]] = {
+    "GOV_DIRECTORY": {"executive_board", "supervisory_board"},
+    "GOV_EXECUTIVE": {"board_of_directors", "supervisory_board"},
+    "GOV_SUPERVISORY": {"board_of_directors", "executive_board"},
+    "GOV_AUDIT": {"board_of_directors", "executive_board", "supervisory_board"},
+}
+
+
+def _embedding_table_has_metadata_column(
+    con: duckdb.DuckDBPyConnection,
+    table_name: str,
+) -> bool:
+    cached = _EMBED_METADATA_COLUMN_CACHE.get(table_name)
+    if cached is not None:
+        return cached
+
+    row = con.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = ?
+          AND column_name = 'chunk_metadata_json'
+        LIMIT 1
+        """,
+        [table_name],
+    ).fetchone()
+    has_col = row is not None
+    _EMBED_METADATA_COLUMN_CACHE[table_name] = has_col
+    return has_col
+
+
+def _embedding_table_for_item(item_code: str) -> str:
+    if item_code in _FS_SOURCE_GOV_ITEMS:
+        return "financial_statement_document_embeddings"
+    return "document_embeddings"
+
+
+def _report_pairs_for_tables(
+    con: duckdb.DuckDBPyConnection,
+    tables: set[str],
+) -> list[tuple[str, int]]:
+    """Return available ticker/year pairs for required embedding table(s)."""
+    if not tables:
+        return []
+
+    if tables == {"document_embeddings"}:
+        rows = con.execute(
+            "SELECT DISTINCT ticker, year FROM document_embeddings ORDER BY ticker, year"
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    if tables == {"financial_statement_document_embeddings"}:
+        rows = con.execute(
+            "SELECT DISTINCT ticker, year FROM financial_statement_document_embeddings ORDER BY ticker, year"
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    rows = con.execute(
+        """
+        SELECT d.ticker, d.year
+        FROM (
+            SELECT DISTINCT ticker, year FROM document_embeddings
+        ) d
+        INNER JOIN (
+            SELECT DISTINCT ticker, year
+            FROM financial_statement_document_embeddings
+        ) f
+          ON f.ticker = d.ticker AND f.year = d.year
+        ORDER BY d.ticker, d.year
+        """
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
 
 
 def _clean_chunk_text_for_prompt(text: str) -> str:
@@ -165,6 +300,8 @@ _GOV_RETRIEVAL_PROFILES: dict[str, dict[str, list[str]]] = {
         "include_terms": [
             "hội đồng quản trị",
             "hoi dong quan tri",
+            "hội đồng quẩn tri",
+            "hoi dong quan tri",
             "hđqt",
             "hdqt",
             "thành viên hđqt",
@@ -173,16 +310,34 @@ _GOV_RETRIEVAL_PROFILES: dict[str, dict[str, list[str]]] = {
             "chu tich hdqt",
         ],
         "exclude_terms": ["ban kiểm soát", "ban kiem soat", "thành viên bks", "thanh vien bks"],
-        "section_terms": ["giới thiệu hội đồng quản trị", "gioi thieu hoi dong quan tri", "hoạt động của hđqt", "hoat dong cua hdqt"],
+        "anchor_terms": [
+            "hội đồng quản trị",
+            "hoi dong quan tri",
+            "hội đồng quẩn tri",
+            "các thành viên hội đồng quản trị",
+            "cac thanh vien hoi dong quan tri",
+        ],
+        "section_terms": [
+            "giới thiệu hội đồng quản trị",
+            "gioi thieu hoi dong quan tri",
+            "hoạt động của hđqt",
+            "hoat dong cua hdqt",
+            "thông tin chung",
+            "thong tin chung",
+        ],
     },
     "GOV_EXECUTIVE": {
         "include_terms": [
             "ban điều hành",
             "ban dieu hanh",
+            "ban tổng giám đốc",
+            "ban tong giam doc",
+            "ban tổng giám dóc",
             "giới thiệu ban điều hành",
             "gioi thieu ban dieu hanh",
             "tổng giám đốc",
             "tong giam doc",
+            "tổng giám dóc",
             "ceo",
             "phó tổng giám đốc",
             "pho tong giam doc",
@@ -204,8 +359,21 @@ _GOV_RETRIEVAL_PROFILES: dict[str, dict[str, list[str]]] = {
             "1.9.2 giới thiệu ban điều hành",
             "giới thiệu ban điều hành",
             "gioi thieu ban dieu hanh",
+            "ban tổng giám đốc",
+            "ban tong giam doc",
+            "các thành viên ban tổng giám đốc",
+            "cac thanh vien ban tong giam doc",
         ],
-        "section_terms": ["giới thiệu ban điều hành", "gioi thieu ban dieu hanh", "ban điều hành", "ban dieu hanh"],
+        "section_terms": [
+            "giới thiệu ban điều hành",
+            "gioi thieu ban dieu hanh",
+            "ban điều hành",
+            "ban dieu hanh",
+            "ban tổng giám đốc",
+            "ban tong giam doc",
+            "thông tin chung",
+            "thong tin chung",
+        ],
     },
     "GOV_AUDIT": {
         "include_terms": [
@@ -252,11 +420,17 @@ _GOV_RETRIEVAL_PROFILES: dict[str, dict[str, list[str]]] = {
         "include_terms": [
             "ban kiểm soát",
             "ban kiem soat",
+            "ban kièm soát",
+            "ban kiem soát",
             "bks",
             "trưởng bks",
             "truong bks",
+            "trưởng ban",
+            "truong ban",
             "thành viên bks",
             "thanh vien bks",
+            "thành viên",
+            "thanh vien",
         ],
         "exclude_terms": [
             "kế toán trưởng",
@@ -274,9 +448,385 @@ _GOV_RETRIEVAL_PROFILES: dict[str, dict[str, list[str]]] = {
             "ủy quyền cbtt",
             "uy quyen cbtt",
         ],
+        "anchor_terms": [
+            "ban kiểm soát",
+            "ban kiem soat",
+            "ban kièm soát",
+            "các thành viên ban kiểm soát",
+            "cac thanh vien ban kiem soat",
+        ],
         "section_terms": ["giới thiệu ban kiểm soát", "gioi thieu ban kiem soat", "hoạt động của bks", "hoat dong cua bks"],
     },
 }
+
+
+def _normalize_financial_statement_governance_result(
+    item_code: str,
+    result: dict,
+    chunks: list[dict],
+) -> dict:
+    """Normalize governance results produced from financial-statement sources."""
+    normalized = dict(result or {})
+    normalized.setdefault("found", False)
+    normalized.setdefault("value", {})
+    normalized.setdefault("details", [])
+    normalized.setdefault("reason", "")
+
+    if not isinstance(normalized.get("details"), list):
+        normalized["details"] = []
+    if not isinstance(normalized.get("value"), dict):
+        normalized["value"] = {}
+
+    if item_code in _FS_GOV_ITEM_CODES.values():
+        normalized["value"] = {}
+
+        cleaned_details: list[dict] = []
+        seen_names: set[str] = set()
+        for detail in normalized.get("details", []):
+            if not isinstance(detail, dict):
+                continue
+            raw_name = str(detail.get("name") or "")
+            cleaned_name = _extract_person_name_from_text(raw_name)
+            if not cleaned_name:
+                continue
+            key = cleaned_name.lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            cleaned_details.append(
+                {
+                    "name": cleaned_name,
+                    "gender": _normalize_gender_label(detail.get("gender")),
+                }
+            )
+
+        if item_code == "GOV_SUPERVISORY_FS":
+            fallback_details = _fallback_parse_supervisory_members_from_text(chunks)
+            if not fallback_details:
+                fallback_details = _fallback_parse_audit_committee_members_from_text(
+                    chunks
+                )
+
+            fallback_cleaned: list[dict] = []
+            fallback_seen: set[str] = set()
+            for detail in fallback_details:
+                if not isinstance(detail, dict):
+                    continue
+                cleaned_name = _extract_person_name_from_text(
+                    str(detail.get("name") or "")
+                )
+                if not cleaned_name:
+                    continue
+                key = cleaned_name.lower()
+                if key in fallback_seen:
+                    continue
+                fallback_seen.add(key)
+                fallback_cleaned.append(
+                    {
+                        "name": cleaned_name,
+                        "gender": _normalize_gender_label(detail.get("gender")),
+                    }
+                )
+
+            if fallback_cleaned and len(fallback_cleaned) > len(cleaned_details):
+                cleaned_details = fallback_cleaned
+                reason_text = str(normalized.get("reason") or "").strip()
+                fallback_note = (
+                    "Used fallback roster parsing from financial statement text."
+                )
+                normalized["reason"] = (
+                    f"{reason_text} ({fallback_note})"
+                    if reason_text
+                    else fallback_note
+                )
+
+        normalized["details"] = cleaned_details
+        normalized["found"] = bool(cleaned_details)
+
+    return normalized
+
+
+def _normalize_gender_label(gender: object) -> str:
+    gender_text = str(gender or "").strip().lower()
+    if gender_text in {"female", "bà", "ba", "f", "nu"}:
+        return "Bà"
+    if gender_text in {"male", "ông", "ong", "m", "nam"}:
+        return "Ông"
+    return ""
+
+
+def _extract_person_name_from_text(raw_name: str) -> str:
+    text = re.sub(r"\s+", " ", str(raw_name or "")).strip(" .,:;-")
+    if not text:
+        return ""
+
+    # Drop obvious OCR/table payloads early.
+    if any(tok in text for tok in ["|", "<", ">", "#", "http://", "https://"]):
+        return ""
+
+    honorific_name_pattern = re.compile(
+        r"(?:Ông|Bà)\s+([A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+(?:\s+[A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+){1,5})"
+    )
+    match = honorific_name_pattern.search(text)
+    candidate = match.group(1).strip() if match else text
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .,:;-")
+
+    tokens = [tok for tok in candidate.split(" ") if tok]
+    if len(tokens) < 2:
+        return ""
+    if len(tokens) > 6:
+        tokens = tokens[:6]
+    candidate = " ".join(tokens)
+
+    if any(ch.isdigit() for ch in candidate):
+        return ""
+
+    low = candidate.lower()
+    banned_terms = [
+        "công ty",
+        "bao cao",
+        "báo cáo",
+        "hội đồng",
+        "ban kiểm",
+        "kiểm toán",
+        "thuyết minh",
+        "tài sản",
+        "nguồn vốn",
+        "doanh thu",
+        "lợi nhuận",
+    ]
+    if any(term in low for term in banned_terms):
+        return ""
+
+    return candidate
+
+
+def _strip_accents(text: str) -> str:
+    return "".join(
+        ch
+        for ch in unicodedata.normalize("NFD", text)
+        if unicodedata.category(ch) != "Mn"
+    )
+
+
+def _fallback_parse_supervisory_members_from_text(chunks: list[dict]) -> list[dict]:
+    """Parse compact BKS roster text when LLM returns empty details.
+
+    Handles OCR-joined lines like:
+    'Ba Nguyen Thi A Truong ban Ba Nguyen Thi B Thanh vien ...'
+    """
+    if not chunks:
+        return []
+
+    merged = "\n".join(
+        _clean_chunk_text_for_prompt(str(c.get("chunk_text") or ""))
+        for c in chunks
+    )
+    text = re.sub(r"\s+", " ", merged).strip()
+    if not text:
+        return []
+
+    ascii_text = _strip_accents(text).lower()
+    start = ascii_text.find("ban kiem soat")
+    if start < 0:
+        return []
+
+    stop_terms = [
+        "uy ban kiem toan",
+        "nguoi dai dien theo phap luat",
+        "kiem toan vien",
+        "bao cao kiem toan",
+        "bang can doi",
+        "thuyet minh",
+    ]
+    end = len(text)
+    for term in stop_terms:
+        idx = ascii_text.find(term, start + 1)
+        if idx >= 0:
+            end = min(end, idx)
+
+    section = text[start:end][:2000]
+
+    pattern = re.compile(
+        r"(Ông|Bà)\s+([A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+(?:\s+[A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+){1,5})\s+(Trưởng\s+ban|Thành\s+viên)",
+        flags=re.IGNORECASE,
+    )
+    members: list[dict] = []
+    for m in pattern.finditer(section):
+        honorific = str(m.group(1) or "").strip()
+        raw_name = str(m.group(2) or "").strip(" .,:;-")
+        role = str(m.group(3) or "").strip()
+        if not raw_name:
+            continue
+        members.append(
+            {
+                "name": raw_name,
+                "position": role,
+                "gender": "female" if honorific.lower() == "bà" else "male",
+                "is_independent": None,
+                "date_of_birth": None,
+                "appointment_date": None,
+                "term_end": None,
+                "education": None,
+                "shares_owned": None,
+                "notes": "Parsed from compact BKS roster line in financial statement.",
+            }
+        )
+
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for member in members:
+        key = str(member.get("name") or "").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(member)
+    return deduped
+
+
+def _fallback_parse_audit_committee_members_from_text(
+    chunks: list[dict],
+) -> list[dict]:
+    """Parse Audit Committee roster as supervisory proxy when BKS is absent.
+
+    Some financial statements disclose governance through "Uy ban kiem toan"
+    instead of an explicit "Ban Kiem soat" section.
+    """
+    if not chunks:
+        return []
+
+    merged = "\n".join(
+        _clean_chunk_text_for_prompt(str(c.get("chunk_text") or ""))
+        for c in chunks
+    )
+    text = re.sub(r"\s+", " ", merged).strip()
+    if not text:
+        return []
+
+    ascii_text = _strip_accents(text).lower()
+    start = ascii_text.find("uy ban kiem toan")
+    if start < 0:
+        return []
+
+    stop_terms = [
+        "nguoi dai dien theo phap luat",
+        "kiem toan vien",
+        "bao cao kiem toan",
+        "bang can doi",
+        "thuyet minh",
+    ]
+    end = len(text)
+    for term in stop_terms:
+        idx = ascii_text.find(term, start + 1)
+        if idx >= 0:
+            end = min(end, idx)
+
+    section = text[start:end][:2500]
+
+    member_pattern = re.compile(
+        r"(Ông|Bà)\s+([A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+(?:\s+[A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+){1,5})\s+(Chủ tịch|Thành viên)",
+        flags=re.IGNORECASE,
+    )
+    backup_pattern = re.compile(
+        r"(Ông|Bà)\s+([A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+(?:\s+[A-ZÀ-ỴĐ][A-Za-zÀ-ỹĐđ]+){1,5})(?=\s+(?:Ông|Bà)\s+|$)",
+        flags=re.IGNORECASE,
+    )
+
+    members: list[dict] = []
+    seen: set[str] = set()
+
+    def _clean_name(raw: str) -> str:
+        name = re.sub(r"\s+", " ", raw).strip(" .,:;-")
+        name = re.sub(r"\b(Chủ\s+tịch|Thành\s+viên)\b$", "", name, flags=re.IGNORECASE).strip(" .,:;-")
+        # Keep only person-like token spans and avoid OCR tails.
+        tokens = [tok for tok in name.split(" ") if tok]
+        if len(tokens) < 2:
+            return ""
+        if len(tokens) > 6:
+            tokens = tokens[:6]
+        cleaned = " ".join(tokens)
+        if any(ch.isdigit() for ch in cleaned):
+            return ""
+        low = cleaned.lower()
+        if any(
+            bad in low
+            for bad in [
+                "hội đồng",
+                "ban kiểm soát",
+                "ban tổng",
+                "tổng giám đốc",
+                "công ty",
+                "báo cáo",
+                "kiểm toán",
+            ]
+        ):
+            return ""
+        return cleaned
+
+    for m in member_pattern.finditer(section):
+        honorific = str(m.group(1) or "").strip()
+        raw_name = str(m.group(2) or "")
+        role = str(m.group(3) or "").strip()
+        name = _clean_name(raw_name)
+        if not name:
+            continue
+
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        members.append(
+            {
+                "name": name,
+                "position": f"Ủy ban kiểm toán - {role}",
+                "gender": "female" if honorific.lower() == "bà" else "male",
+                "is_independent": None,
+                "date_of_birth": None,
+                "appointment_date": None,
+                "term_end": None,
+                "education": None,
+                "shares_owned": None,
+                "notes": (
+                    "Parsed from Audit Committee roster in financial statement "
+                    "as supervisory proxy when BKS roster is absent."
+                ),
+            }
+        )
+
+    if members:
+        return members
+
+    for m in backup_pattern.finditer(section):
+        honorific = str(m.group(1) or "").strip()
+        raw_name = str(m.group(2) or "")
+        name = _clean_name(raw_name)
+        if not name:
+            continue
+
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        members.append(
+            {
+                "name": name,
+                "position": "Ủy ban kiểm toán - Thành viên",
+                "gender": "female" if honorific.lower() == "bà" else "male",
+                "is_independent": None,
+                "date_of_birth": None,
+                "appointment_date": None,
+                "term_end": None,
+                "education": None,
+                "shares_owned": None,
+                "notes": (
+                    "Parsed from Audit Committee roster in financial statement "
+                    "as supervisory proxy when BKS roster is absent."
+                ),
+            }
+        )
+
+    return members
 
 
 def _count_hits(text: str, terms: list[str]) -> int:
@@ -303,6 +853,25 @@ def _hybrid_score_for_chunk(chunk: dict, item_code: str) -> tuple[float, dict[st
 
     semantic_score = _semantic_score_from_distance(distance)
 
+    metadata = parse_chunk_metadata(chunk.get("chunk_metadata_json"))
+    section_tags = set(str(s) for s in metadata.get("section_tags", []))
+    role_tags = set(str(s) for s in metadata.get("role_tags", []))
+    expected_tags = _GOV_METADATA_TAGS.get(item_code, set())
+    conflict_tags = _GOV_CONFLICT_TAGS.get(item_code, set())
+
+    matched_tags = len(section_tags.intersection(expected_tags))
+    role_matches = len(role_tags.intersection({
+        "gov_directory" if item_code == "GOV_DIRECTORY" else "",
+        "gov_executive" if item_code == "GOV_EXECUTIVE" else "",
+        "gov_supervisory" if item_code == "GOV_SUPERVISORY" else "",
+        "gov_audit" if item_code == "GOV_AUDIT" else "",
+        "gov_shareholders" if item_code == "GOV_SHAREHOLDERS" else "",
+    }))
+    conflict_hits = len(section_tags.intersection(conflict_tags))
+
+    metadata_prior = min(1.0, 0.45 * matched_tags + 0.35 * role_matches)
+    metadata_penalty = min(1.0, 0.35 * conflict_hits)
+
     # Lexical score is normalized to [-1, 1] to keep it stable across chunk sizes.
     lexical_raw = include_hits - exclude_hits
     lexical_norm = lexical_raw / max(1, include_hits + exclude_hits)
@@ -314,11 +883,15 @@ def _hybrid_score_for_chunk(chunk: dict, item_code: str) -> tuple[float, dict[st
         INFERENCE_RETRIEVAL_ALPHA * semantic_score
         + INFERENCE_RETRIEVAL_BETA * lexical_norm
         + INFERENCE_RETRIEVAL_GAMMA * section_prior
+        + 0.20 * metadata_prior
+        - 0.15 * metadata_penalty
     )
     return final_score, {
         "semantic": semantic_score,
         "lexical": lexical_norm,
         "section_prior": section_prior,
+        "metadata_prior": metadata_prior,
+        "metadata_penalty": metadata_penalty,
         "include_hits": float(include_hits),
         "exclude_hits": float(exclude_hits),
     }
@@ -332,6 +905,7 @@ def _get_section_window_candidates(
     *,
     anchor_terms: list[str] | None = None,
     section_terms: list[str],
+    embeddings_table: str = "document_embeddings",
     window_before: int = 1,
     window_after: int = 24,
     max_chunks: int = 120,
@@ -345,7 +919,7 @@ def _get_section_window_candidates(
         anchor_params = [f"%{term.lower()}%" for term in terms]
         anchor_sql = f"""
             SELECT DISTINCT chunk_index
-            FROM document_embeddings
+                        FROM {embeddings_table}
             WHERE ticker = ? AND year = ?
               AND ({anchor_clauses})
             ORDER BY chunk_index
@@ -373,13 +947,17 @@ def _get_section_window_candidates(
     for start_idx, end_idx in ranges:
         range_params.extend([start_idx, end_idx])
 
+    has_meta_col = _embedding_table_has_metadata_column(con, embeddings_table)
+    metadata_select = "chunk_metadata_json" if has_meta_col else "NULL AS chunk_metadata_json"
+
     sql = f"""
         SELECT
             chunk_index,
             chunk_text,
             token_count,
+            {metadata_select},
             list_cosine_distance(embedding::FLOAT[], ?::FLOAT[]) AS distance
-        FROM document_embeddings
+                FROM {embeddings_table}
         WHERE ticker = ? AND year = ?
           AND ({range_clauses})
         ORDER BY chunk_index ASC
@@ -394,7 +972,8 @@ def _get_section_window_candidates(
             "chunk_index": r[0],
             "chunk_text": r[1],
             "token_count": r[2],
-            "distance": r[3],
+            "chunk_metadata_json": r[3],
+            "distance": r[4],
         }
         for r in rows
     ]
@@ -427,6 +1006,9 @@ def retrieve_chunks_for_gov_item(
         raise ValueError(f"Unknown governance item code: {item_code}")
 
     query_emb = cat_embeddings[item_code]
+    embeddings_table = _embedding_table_for_item(item_code)
+    has_meta_col = _embedding_table_has_metadata_column(con, embeddings_table)
+    metadata_select = "chunk_metadata_json" if has_meta_col else "NULL AS chunk_metadata_json"
 
     # Phase 1 hybrid retrieval:
     # 1) fetch wider semantic candidates,
@@ -437,8 +1019,9 @@ def retrieve_chunks_for_gov_item(
             chunk_index,
             chunk_text,
             token_count,
+            {metadata_select},
             list_cosine_distance(embedding::FLOAT[], ?::FLOAT[]) AS distance
-        FROM document_embeddings
+        FROM {embeddings_table}
         WHERE ticker = ? AND year = ?
         ORDER BY distance ASC
         LIMIT ?
@@ -451,7 +1034,8 @@ def retrieve_chunks_for_gov_item(
             "chunk_index": r[0],
             "chunk_text": r[1],
             "token_count": r[2],
-            "distance": r[3],
+            "chunk_metadata_json": r[3],
+            "distance": r[4],
         }
         for r in rows
     ]
@@ -462,7 +1046,7 @@ def retrieve_chunks_for_gov_item(
         score, components = _hybrid_score_for_chunk(chunk, item_code)
         rescored.append({**chunk, "_hybrid_score": score, "_score_parts": components})
 
-    if item_code == "GOV_EXECUTIVE":
+    if item_code in _LEADERSHIP_ROSTER_ITEMS:
         profile = _GOV_RETRIEVAL_PROFILES.get(item_code, {})
         executive_section_candidates = _get_section_window_candidates(
             con,
@@ -471,7 +1055,35 @@ def retrieve_chunks_for_gov_item(
             query_emb,
             anchor_terms=profile.get("anchor_terms", []),
             section_terms=profile.get("section_terms", []),
+            embeddings_table=embeddings_table,
         )
+
+        # In financial statements, board/executive/supervisory rosters are often
+        # contiguous in the same "Thông tin chung" leadership section.
+        shared_candidates = _get_section_window_candidates(
+            con,
+            ticker,
+            year,
+            query_emb,
+            anchor_terms=_LEADERSHIP_SECTION_ANCHORS,
+            section_terms=_LEADERSHIP_SECTION_ANCHORS,
+            embeddings_table=embeddings_table,
+            window_before=2,
+            window_after=28,
+            max_chunks=140,
+        )
+        if shared_candidates:
+            by_index: dict[int, dict] = {
+                int(c["chunk_index"]): c for c in executive_section_candidates
+            }
+            for chunk in shared_candidates:
+                idx = int(chunk["chunk_index"])
+                if idx not in by_index:
+                    by_index[idx] = chunk
+            executive_section_candidates = [
+                by_index[idx] for idx in sorted(by_index)
+            ]
+
         if executive_section_candidates:
             by_index: dict[int, dict] = {
                 int(c["chunk_index"]): c for c in rescored
@@ -547,7 +1159,7 @@ def retrieve_chunks_for_gov_item(
 # LLM evaluation prompts
 # ---------------------------------------------------------------------------
 
-_GOV_EXTRACT_PROMPT = """You are a structured data extraction assistant specializing in Vietnamese annual reports (Báo cáo thường niên). You will be given text from an annual report and a specific extraction task.
+_GOV_EXTRACT_PROMPT = """You are a structured data extraction assistant specializing in Vietnamese corporate reports (annual reports and financial statements). You will be given text from a report and a specific extraction task.
 
 Your job is to extract ALL information related to the task — list every person, entity, and data point you can find. Be exhaustive: if 7 board members are mentioned, list all 7 with all available details for each.
 
@@ -557,6 +1169,11 @@ Rules:
 - If a field is not mentioned for a person, use `null` for that field — do NOT skip the person.
 - Translate Vietnamese names to their original form (keep Vietnamese diacritics).
 - Infer gender from Vietnamese names when not explicitly stated (e.g., "Nguyễn Thị ..." → female, "Nguyễn Văn ..." → male).
+- For financial statements, leadership rosters often appear in compact sections such as "Thông tin chung", "Hội đồng quản trị", "Ban điều hành", or "Ban kiểm soát"; treat those sections as authoritative even if the names are listed in short lines or tables.
+- Combined leadership sections that mention several bodies in one heading (for example "Thành viên Hội đồng Quản trị, Ban Kiểm soát và Ban Tổng Giám đốc") should be treated as a source for all relevant rosters in that section.
+- A roster may appear as a short line, table row, or multi-line list after the heading, so do not require a long paragraph to extract names and roles.
+- Do not omit people just because their title is brief or the roster is split across multiple lines.
+- If the text contains a list of names followed by titles or roles, extract each person individually.
 - Return ONLY a valid JSON object — no additional text.
 
 The JSON must have these properties:
@@ -664,6 +1281,30 @@ _GOV_ITEM_OUTPUT_TEMPLATES: dict[str, str] = {
     if item.get("json_template")
 }
 
+_FS_GOV_ITEM_OUTPUT_TEMPLATES: dict[str, str] = {
+    "GOV_DIRECTORY_FS": """{
+  "value": {},
+  "details": [
+    {"name": "Nguyễn Văn A", "gender": "Ông"}
+  ],
+  "reason": "Extracted from financial-statement leadership roster."
+}""",
+    "GOV_EXECUTIVE_FS": """{
+  "value": {},
+  "details": [
+    {"name": "Nguyễn Văn A", "gender": "Ông"}
+  ],
+  "reason": "Extracted from financial-statement executive roster."
+}""",
+    "GOV_SUPERVISORY_FS": """{
+  "value": {},
+  "details": [
+    {"name": "Nguyễn Thị B", "gender": "Bà"}
+  ],
+  "reason": "Extracted from financial-statement supervisory roster."
+}""",
+}
+
 
 def evaluate_gov_item(
     chunks: list[dict],
@@ -722,37 +1363,46 @@ def evaluate_gov_item(
         selected_chunks = [""]
 
     content = "\n".join(selected_chunks)
-    output_format = _GOV_ITEM_OUTPUT_TEMPLATES.get(
+    output_format = _FS_GOV_ITEM_OUTPUT_TEMPLATES.get(
         item_code,
-        _OUTPUT_FORMATS.get(
-        item_code,
-        '{"found": true/false, "value": ..., "details": [...], "reason": "..."}',
+        _GOV_ITEM_OUTPUT_TEMPLATES.get(
+            item_code,
+            _OUTPUT_FORMATS.get(
+                item_code,
+                '{"found": true/false, "value": ..., "details": [...], "reason": "..."}',
+            ),
         ),
     )
     extra_constraint = ""
     if item_code == "GOV_DIRECTORY":
         extra_constraint = (
             "\n\nSTRICT SCOPE for this task:\n"
+            "- Extract the board-of-directors roster from financial-statement leadership sections such as 'Hội đồng quản trị', 'HĐQT', or 'Thông tin chung'.\n"
             "- Mark is_independent=true ONLY when the source explicitly indicates independent board member status (e.g., 'Thanh vien HDQT doc lap' / 'Thành viên HĐQT độc lập').\n"
             "- independent_reason must cite that explicit phrase from position/title or nearby text.\n"
             "- If no explicit evidence exists, set is_independent=false and independent_reason=null.\n"
-            "- Exclude executive-only roster fields from Ban Dieu hanh in this task."
+            "- Exclude executive-only roster fields from Ban Dieu hanh in this task.\n"
+            "- If the section combines multiple bodies in one heading, extract the relevant board roster from that section rather than skipping it."
         )
     elif item_code == "GOV_EXECUTIVE":
         extra_constraint = (
             "\n\nSTRICT SCOPE for this task:\n"
-            "- Extract ONLY executive management roster (Ban Dieu hanh): Tong Giam doc/CEO, Pho Tong Giam doc, Ke toan truong, and equivalent executive roles.\n"
+            "- Extract the executive management roster from financial-statement sections such as 'Ban điều hành', 'Ban Điều hành', 'Tổng giám đốc', or 'Thông tin chung'.\n"
+            "- Extract ONLY executive management roles (Tong Giam doc/CEO, Pho Tong Giam doc, Ke toan truong, and equivalent executive roles).\n"
             "- Mark is_executive=true ONLY when position/title explicitly contains executive role evidence (e.g., CEO/Tong Giam doc/Pho Tong Giam doc/Ke toan truong).\n"
             "- If no explicit executive evidence exists, set is_executive=false and executive_reason=null.\n"
             "- Exclude independent board-only profiles (e.g., 'Thanh vien HDQT doc lap') unless they also explicitly hold executive title.\n"
-            "- Set is_board_member=true only when the person is explicitly also a board member."
+            "- Set is_board_member=true only when the person is explicitly also a board member.\n"
+            "- If the section combines multiple bodies in one heading, extract the relevant executive roster from that section rather than skipping it."
         )
     elif item_code == "GOV_SUPERVISORY":
         extra_constraint = (
             "\n\nSTRICT SCOPE for this task:\n"
+            "- Extract the supervisory-board roster from financial-statement sections such as 'Ban Kiểm soát', 'BKS', or 'Thông tin chung'.\n"
             "- Include ONLY members explicitly belonging to Ban Kiem soat (BKS) / Supervisory Board.\n"
             "- Exclude Board of Directors, Executive team, and accounting/secretary roles (e.g., Ke toan truong).\n"
-            "- If a person is not clearly identified as BKS member, do not include them in details."
+            "- If a person is not clearly identified as BKS member, do not include them in details.\n"
+            "- If the section combines multiple bodies in one heading, extract the relevant supervisory roster from that section rather than skipping it."
         )
     elif item_code == "GOV_AUDIT":
         extra_constraint = (
@@ -825,7 +1475,16 @@ def evaluate_gov_item(
     details = result.get("details", [])
     value = result.get("value")
 
-    if item_code == "GOV_DIRECTORY" and isinstance(details, list):
+    if item_code in _FS_GOV_ITEM_CODES.values():
+        result = _normalize_financial_statement_governance_result(item_code, result, chunks)
+        details = result.get("details", [])
+        value = result.get("value")
+
+    if item_code in _FS_GOV_ITEM_CODES.values():
+        result = _normalize_financial_statement_governance_result(item_code, result, chunks)
+        details = result.get("details", [])
+        value = result.get("value")
+    elif item_code == "GOV_DIRECTORY" and isinstance(details, list):
         explicit_independent_terms = [
             "thành viên hđqt độc lập",
             "thanh vien hdqt doc lap",
@@ -1013,6 +1672,37 @@ def evaluate_gov_item(
             ):
                 continue
             filtered_details.append(detail)
+
+        if not filtered_details:
+            fallback_details = _fallback_parse_supervisory_members_from_text(chunks)
+            if fallback_details:
+                filtered_details = fallback_details
+                result_reason = str(result.get("reason", "")).strip()
+                if result_reason:
+                    result["reason"] = (
+                        f"{result_reason} (Applied fallback parsing for compact BKS roster text.)"
+                    )
+                else:
+                    result["reason"] = (
+                        "Applied fallback parsing for compact BKS roster text."
+                    )
+
+        if not filtered_details:
+            audit_committee_details = _fallback_parse_audit_committee_members_from_text(
+                chunks
+            )
+            if audit_committee_details:
+                filtered_details = audit_committee_details
+                result_reason = str(result.get("reason", "")).strip()
+                if result_reason:
+                    result["reason"] = (
+                        f"{result_reason} "
+                        "(Used Audit Committee roster as supervisory proxy for financial statement.)"
+                    )
+                else:
+                    result["reason"] = (
+                        "Used Audit Committee roster as supervisory proxy for financial statement."
+                    )
 
         if len(filtered_details) != len(details):
             details = filtered_details
@@ -1400,11 +2090,13 @@ def create_governance_jobs(
 ) -> int:
     """Create pending governance extraction jobs for embedded reports."""
     inference_model = inference_model or INFERENCE_MODEL
+    governance_items = get_task_items("governance", item_configs)
+    required_tables = {
+        _embedding_table_for_item(item["code"])
+        for item in governance_items
+    }
 
-    rows = con.execute(
-        "SELECT DISTINCT ticker, year FROM document_embeddings"
-    ).fetchall()
-    embedded = [(r[0], r[1]) for r in rows]
+    embedded = _report_pairs_for_tables(con, required_tables)
 
     if tickers:
         upper = {t.upper() for t in tickers}
@@ -1412,7 +2104,7 @@ def create_governance_jobs(
     if years:
         embedded = [(t, y) for t, y in embedded if y in years]
 
-    total_items = len(get_task_items("governance", item_configs))
+    total_items = len(governance_items)
     created = 0
     for ticker, year in embedded:
         existing = con.execute(
@@ -1792,6 +2484,12 @@ def extract_governance(
 
             output_map = get_batch_output_map(client, batch_id)
             by_code = {it["code"]: it for it in governance_items}
+            by_code.update(
+                {
+                    _governance_item_code_for_source(it["code"], "financial_statement_document_embeddings"): it
+                    for it in governance_items
+                }
+            )
             done_now = 0
             for code, raw in output_map.items():
                 item = by_code.get(code)
@@ -1800,11 +2498,13 @@ def extract_governance(
 
                 # Preserve similarity/top chunk metadata by repeating retrieval.
                 gov_top_k = max(top_k, 10)
+                source_table = _embedding_table_for_item(item["code"])
+                storage_code = _governance_item_code_for_source(item["code"], source_table)
                 chunks = retrieve_chunks_for_gov_item(
                     con,
                     ticker,
                     year,
-                    code,
+                    item["code"],
                     top_k=gov_top_k,
                     model=embedding_model,
                     dimensions=dimensions,
@@ -1818,6 +2518,60 @@ def extract_governance(
                         "details": [],
                         "reason": f"Failed to parse LLM response: {raw}",
                     }
+
+                # Re-apply core post-processing for batch outputs.
+                if item["code"] == "GOV_SUPERVISORY":
+                    details_candidate = parsed.get("details", [])
+                    if not isinstance(details_candidate, list):
+                        details_candidate = []
+                    if not details_candidate:
+                        fallback_details = _fallback_parse_supervisory_members_from_text(
+                            chunks
+                        )
+                        if not fallback_details:
+                            fallback_details = _fallback_parse_audit_committee_members_from_text(
+                                chunks
+                            )
+                        if fallback_details:
+                            parsed["details"] = fallback_details
+                            parsed["value"] = {
+                                "total_members": len(fallback_details),
+                                "women_count": sum(
+                                    1
+                                    for d in fallback_details
+                                    if str(d.get("gender") or "").strip().lower()
+                                    == "female"
+                                ),
+                                "men_count": sum(
+                                    1
+                                    for d in fallback_details
+                                    if str(d.get("gender") or "").strip().lower()
+                                    == "male"
+                                ),
+                                "independent_count": sum(
+                                    1
+                                    for d in fallback_details
+                                    if bool(d.get("is_independent"))
+                                ),
+                            }
+                            result_reason = str(parsed.get("reason", "")).strip()
+                            if result_reason:
+                                parsed["reason"] = (
+                                    f"{result_reason} "
+                                    "(Applied supervisory fallback parsing from financial-statement roster text.)"
+                                )
+                            else:
+                                parsed["reason"] = (
+                                    "Applied supervisory fallback parsing from financial-statement roster text."
+                                )
+
+                if storage_code in _FS_GOV_ITEM_CODES.values():
+                    parsed = _normalize_financial_statement_governance_result(
+                        storage_code,
+                        parsed,
+                        chunks,
+                    )
+
                 details = parsed.get("details", [])
                 value = parsed.get("value")
                 found = bool(details) or (value is not None and value != {})
@@ -1847,7 +2601,7 @@ def extract_governance(
                     [
                         ticker,
                         year,
-                        code,
+                        storage_code,
                         found,
                         value_json,
                         details_json,
@@ -1891,20 +2645,6 @@ def extract_governance(
                 con.close()
             return done_now
 
-        # Check embeddings exist
-        row = con.execute(
-            "SELECT COUNT(*) FROM document_embeddings "
-            "WHERE ticker = ? AND year = ?",
-            [ticker, year],
-        ).fetchone()
-        emb_count = row[0] if row else 0
-
-        if emb_count == 0:
-            raise ValueError(
-                f"No embeddings found for {ticker}/{year}. "
-                "Embed the report first."
-            )
-
         if replace:
             if item_codes:
                 placeholders = ",".join(["?"] * len(item_codes))
@@ -1925,17 +2665,74 @@ def extract_governance(
         prompts: dict[str, str] = {}
         for item in items_to_eval:
             code = item["code"]
+            source_table = _embedding_table_for_item(code)
+            storage_code = _governance_item_code_for_source(code, source_table)
 
             if not replace:
                 existing = con.execute(
                     f"SELECT 1 FROM {GOV_RESULTS_WRITE_TABLE} "
                     "WHERE ticker = ? AND year = ? AND item_code = ? "
                     "AND model = ?",
-                    [ticker, year, code, inference_model],
+                    [ticker, year, storage_code, inference_model],
                 ).fetchone()
                 if existing:
                     done += 1
                     continue
+
+            row = con.execute(
+                f"SELECT COUNT(*) FROM {source_table} "
+                "WHERE ticker = ? AND year = ?",
+                [ticker, year],
+            ).fetchone()
+            emb_count = row[0] if row else 0
+            if emb_count == 0:
+                result = {
+                    "found": False,
+                    "value": None,
+                    "details": [],
+                    "reason": (
+                        "No embeddings found in "
+                        f"{source_table} for {ticker}/{year}. "
+                        "Embed the report first."
+                    ),
+                }
+                similarities_json = json.dumps([])
+                top_chunks_json = json.dumps([])
+                value_json = json.dumps(result.get("value"), ensure_ascii=False)
+                details_json = json.dumps(result.get("details", []), ensure_ascii=False)
+
+                con.execute(
+                    """
+                    INSERT INTO governance_results_hyde2
+                        (id, ticker, year, item_code, found, value_json,
+                         details_json, reason, top_chunks, similarities, model)
+                    VALUES
+                        (nextval('governance_results_id_seq'),
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ticker, year, item_code, model) DO UPDATE SET
+                        found = EXCLUDED.found,
+                        value_json = EXCLUDED.value_json,
+                        details_json = EXCLUDED.details_json,
+                        reason = EXCLUDED.reason,
+                        top_chunks = EXCLUDED.top_chunks,
+                        similarities = EXCLUDED.similarities,
+                        created_at = get_current_timestamp()
+                    """,
+                    [
+                        ticker,
+                        year,
+                        storage_code,
+                        result["found"],
+                        value_json,
+                        details_json,
+                        result["reason"],
+                        top_chunks_json,
+                        similarities_json,
+                        inference_model,
+                    ],
+                )
+                done += 1
+                continue
 
             # Use more chunks for governance extraction (richer context)
             gov_top_k = max(top_k, 10)
@@ -1982,7 +2779,7 @@ def extract_governance(
                     [
                         ticker,
                         year,
-                        code,
+                        storage_code,
                         result["found"],
                         value_json,
                         details_json,
@@ -1995,7 +2792,7 @@ def extract_governance(
                 done += 1
                 continue
 
-            prompts[code] = _build_gov_prompt(chunks, code, item["description"])
+            prompts[storage_code] = _build_gov_prompt(chunks, code, item["description"])
 
         if prompts:
             is_reasoning = inference_model.startswith(("o1", "o3", "o4", "gpt-5"))
@@ -2182,11 +2979,13 @@ def extract_governance_item_all_reports(
     con = get_connection()
     ensure_vss_loaded(con)
 
-    rows = con.execute(
-        "SELECT DISTINCT ticker, year FROM document_embeddings "
-        "ORDER BY ticker, year"
-    ).fetchall()
-    reports = [(r[0], r[1]) for r in rows]
+    normalized_item_codes = normalize_item_codes("governance", item_codes)
+    required_tables = {
+        _embedding_table_for_item(code)
+        for code in normalized_item_codes
+    }
+
+    reports = _report_pairs_for_tables(con, required_tables)
 
     if tickers:
         upper = {t.upper() for t in tickers}
@@ -2209,7 +3008,7 @@ def extract_governance_item_all_reports(
                 inference_model=inference_model,
                 embedding_model=embedding_model,
                 dimensions=dimensions,
-                item_codes=item_codes,
+                item_codes=normalized_item_codes,
             )
             if n > 0:
                 results["evaluated"].append((ticker, year, n))

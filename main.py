@@ -36,6 +36,7 @@ from database import (
     ensure_vss_loaded,
     get_connection,
     init_db,
+    sync_companies_from_stocks,
 )
 from sql_templates import (
     DATA_STUDIO_SQL_TEMPLATES,
@@ -611,7 +612,7 @@ def _make_convert(
     force: Callable[[], bool] = lambda: False,
 ) -> Callable:
     def run():
-        from converter import create_jobs, get_job_summary, run_job
+        from converter import create_jobs, run_job
         from vietstock_documents import DOC_TYPE_ANNUAL_REPORT
 
         con = get_connection()
@@ -622,27 +623,16 @@ def _make_convert(
             selected_output_dir = str(output_dir() or MARKDOWN_DIR)
             scope_label = str(job_scope_label() or "Selected")
 
-            # Skip only if there are no pending jobs and some completed (unless forced)
-            summary = get_job_summary(con)
-            if (
-                summary.get("pending", 0) == 0
-                and summary.get("completed", 0) > 0
-                and not force()
-            ):
-                state.summary = (
-                    f"⏭ Already converted ({summary['completed']:,} jobs completed). "
-                    f"{summary.get('failed', 0)} failed"
-                )
-                return
-
             selected = ticker_filter() or None
+            sy = start_year()
+            ey = end_year()
 
             # Create jobs for any new staged PDFs
             created = create_jobs(
                 con,
                 tickers=selected,
-                start_year=start_year(),
-                end_year=end_year(),
+                start_year=sy,
+                end_year=ey,
                 doc_type=selected_doc_type,
                 output_dir=selected_output_dir,
             )
@@ -656,6 +646,37 @@ def _make_convert(
                 )
                 refresh()
 
+            summary_sql = (
+                "SELECT "
+                "  COUNT(*) FILTER (WHERE status = 'pending') AS pending, "
+                "  COUNT(*) FILTER (WHERE status = 'completed') AS completed, "
+                "  COUNT(*) FILTER (WHERE status = 'failed') AS failed "
+                "FROM conversion_jobs WHERE output_dir = ? "
+            )
+            summary_params: list = [selected_output_dir]
+            if selected:
+                placeholders = ", ".join(["?"] * len(selected))
+                summary_sql += f"AND ticker IN ({placeholders}) "
+                summary_params.extend([t.upper() for t in selected])
+            if sy is not None:
+                summary_sql += "AND year >= ? "
+                summary_params.append(int(sy))
+            if ey is not None:
+                summary_sql += "AND year <= ? "
+                summary_params.append(int(ey))
+
+            summary_row = con.execute(
+                summary_sql,
+                summary_params,
+            ).fetchone() or (0, 0, 0)
+            pending_count, completed_count, failed_count = summary_row
+            if int(pending_count or 0) == 0 and int(completed_count or 0) > 0 and not force():
+                state.summary = (
+                    f"⏭ Already converted ({int(completed_count or 0):,} jobs completed). "
+                    f"{int(failed_count or 0)} failed"
+                )
+                return
+
             # Run selected pending jobs
             job_sql = (
                 "SELECT id, ticker, year FROM conversion_jobs "
@@ -666,8 +687,6 @@ def _make_convert(
                 placeholders = ", ".join(["?"] * len(selected))
                 job_sql += f"AND ticker IN ({placeholders}) "
                 params.extend([t.upper() for t in selected])
-            sy = start_year()
-            ey = end_year()
             if sy is not None:
                 job_sql += "AND year >= ? "
                 params.append(int(sy))
@@ -1122,6 +1141,93 @@ def _make_extract_governance(
     return run
 
 
+def _make_extract_financial_statement_audit(
+    state: TaskState,
+    refresh: Callable,
+    *,
+    ticker_filter: Callable[[], list[str] | None] = lambda: None,
+    year_filter: Callable[[], list[int] | None] = lambda: None,
+    force: Callable[[], bool] = lambda: False,
+    inference_model: Callable[[], str] = lambda: INFERENCE_MODEL,
+    embedding_model: Callable[[], str] = lambda: EMBEDDING_MODEL,
+) -> Callable:
+    def run():
+        from llm_financial_statement_audit import extract_financial_statement_audit_info
+
+        con = get_connection()
+        try:
+            init_db(con)
+            ensure_vss_loaded(con)
+            sql = (
+                "SELECT DISTINCT ticker, year "
+                "FROM financial_statement_document_embeddings WHERE 1=1 "
+            )
+            params: list = []
+
+            selected = ticker_filter() or []
+            years = year_filter() or []
+            if selected:
+                placeholders = ", ".join(["?"] * len(selected))
+                sql += f"AND ticker IN ({placeholders}) "
+                params.extend([t.upper() for t in selected])
+            if years:
+                placeholders = ", ".join(["?"] * len(years))
+                sql += f"AND year IN ({placeholders}) "
+                params.extend([int(y) for y in years])
+            sql += "ORDER BY ticker, year"
+
+            reports = con.execute(sql, params).fetchall()
+            result = {"evaluated": [], "skipped": [], "failed": []}
+            for ticker, year in reports:
+                try:
+                    out = extract_financial_statement_audit_info(
+                        str(ticker),
+                        int(year),
+                        con=con,
+                        replace=force(),
+                        top_k=INFERENCE_TOP_K,
+                        inference_model=inference_model(),
+                        embedding_model=embedding_model(),
+                    )
+                    found = bool(out.get("found"))
+                    detail = (
+                        out.get("audit_firm")
+                        or out.get("audit_opinion")
+                        or ("audit extracted" if found else "no audit evidence")
+                    )
+                    state.rows.append(
+                        TaskRow(
+                            label=f"{ticker} / {year}",
+                            detail=str(detail),
+                            status="done" if found else "skipped",
+                        )
+                    )
+                    if found:
+                        result["evaluated"].append((ticker, year))
+                    else:
+                        result["skipped"].append((ticker, year))
+                except Exception as exc:
+                    state.rows.append(
+                        TaskRow(
+                            label=f"{ticker} / {year}",
+                            detail=str(exc)[:100],
+                            status="error",
+                        )
+                    )
+                    result["failed"].append((ticker, year, str(exc)))
+                refresh()
+        finally:
+            con.close()
+
+        state.summary = (
+            f"✅ {len(result['evaluated'])} extracted, "
+            f"{len(result['skipped'])} skipped, "
+            f"{len(result['failed'])} failed"
+        )
+
+    return run
+
+
 def _make_sync_company_history(
     state: TaskState,
     refresh: Callable,
@@ -1252,7 +1358,8 @@ _PIPELINE_JOBS = [
     ("infer_edc", "13. Infer EDC"),
     ("infer_proper", "14. Infer PROPER-VN"),
     ("infer_governance", "15. Extract Governance"),
-    ("company_history", "16. Sync Company History (Moc lich su)"),
+    ("infer_financial_statement_audit", "16. Extract Financial Statement Audit"),
+    ("company_history", "17. Sync Company History (Moc lich su)"),
 ]
 
 _ALL_JOBS = _INIT_JOBS + _PIPELINE_JOBS
@@ -1660,6 +1767,45 @@ def page_companies():
     with ui.column().classes("w-full max-w-5xl mx-auto gap-4 p-4"):
         ui.label("Company Management").classes("text-2xl font-bold")
 
+        def _sync_all_companies() -> None:
+            from financial_data import fetch_stocks
+
+            con = get_connection()
+            try:
+                init_db(con)
+                stocks_synced = fetch_stocks(con)
+                result = sync_companies_from_stocks(con)
+            finally:
+                con.close()
+
+            ui.notify(
+                "Synced listed companies "
+                f"({stocks_synced:,} stocks refreshed, {result['added']:,} added, "
+                f"{result['existing']:,} already present)"
+            )
+            search_results.refresh()
+            company_table.refresh()
+
+        with ui.row().classes("items-end gap-4 flex-wrap w-full"):
+            exchange_filter = (
+                ui.select(
+                    label="Exchange",
+                    options=["All", "HOSE", "HNX", "UPCOM"],
+                    value="All",
+                    on_change=lambda e: (
+                        search_results.refresh(),
+                        company_table.refresh(),
+                    ),
+                )
+                .props("dense outlined")
+                .classes("w-36")
+            )
+
+            ui.button(
+                "Sync All Companies",
+                on_click=_sync_all_companies,
+            ).props("dense color=primary")
+
         # --- Add company ---
         with ui.card().classes("w-full"):
             ui.label("Add Company").classes("text-lg font-bold")
@@ -1708,16 +1854,24 @@ def page_companies():
                 q = (search_input.value or "").strip()
                 if not q:
                     return
+                exch = exchange_filter.value
                 con = get_connection()
                 try:
+                    conditions = [
+                        "(s.code LIKE ? OR LOWER(s.company_name) LIKE LOWER(?))"
+                    ]
+                    params = [f"%{q.upper()}%", f"%{q}%"]
+                    if exch and exch != "All":
+                        conditions.append("s.floor = ?")
+                        params.append(exch)
                     rows = con.execute(
                         "SELECT s.code, s.floor, s.company_name, "
                         "  CASE WHEN c.ticker IS NOT NULL THEN TRUE ELSE FALSE END AS added "
                         "FROM stocks s "
                         "LEFT JOIN companies c ON s.code = c.ticker "
-                        "WHERE s.code LIKE ? OR LOWER(s.company_name) LIKE LOWER(?) "
+                        f"WHERE {' AND '.join(conditions)} "
                         "ORDER BY s.code LIMIT 50",
-                        [f"%{q.upper()}%", f"%{q}%"],
+                        params,
                     ).fetchall()
                 finally:
                     con.close()
@@ -1812,8 +1966,11 @@ def page_companies():
 
             @ui.refreshable
             def company_table():
+                exch = exchange_filter.value
                 con = get_connection()
                 try:
+                    where = "WHERE s.floor = ?" if exch and exch != "All" else ""
+                    params = [exch] if where else []
                     rows = con.execute("""
                         SELECT
                             c.ticker,
@@ -1826,8 +1983,9 @@ def page_companies():
                             (SELECT COUNT(*) FROM annual_reports ar WHERE ar.ticker = c.ticker)
                         FROM companies c
                         LEFT JOIN stocks s ON c.ticker = s.code
+                    """ + where + """
                         ORDER BY c.ticker
-                        """).fetchall()
+                        """, params).fetchall()
                 finally:
                     con.close()
 
@@ -2247,6 +2405,7 @@ def page_company_targets():
                 )
 
             def _generate_target_jobs() -> None:
+                from llm_financial_statement_audit import create_financial_statement_audit_jobs
                 from llm_governance import create_governance_jobs
                 from llm_inference import create_inference_jobs
                 from llm_proper_vn import create_proper_vn_jobs
@@ -2288,12 +2447,20 @@ def page_company_targets():
                         replace=replace,
                         inference_model=model,
                     )
+                    financial_statement_audit_created = create_financial_statement_audit_jobs(
+                        con,
+                        tickers=eligible,
+                        replace=replace,
+                        inference_model=model,
+                    )
                 finally:
                     con.close()
 
                 ui.notify(
                     "Created jobs - "
-                    f"EDC: {edc_created}, PROPER: {proper_created}, GOV: {gov_created}"
+                    "EDC: "
+                    f"{edc_created}, PROPER: {proper_created}, GOV: {gov_created}, "
+                    f"FS_AUDIT: {financial_statement_audit_created}"
                 )
                 target_status_table.refresh()
 
@@ -2352,6 +2519,9 @@ def page_company_targets():
 
             def _make_run_pending_targets(kind: str) -> Callable:
                 def run() -> None:
+                    from llm_financial_statement_audit import (
+                        extract_financial_statement_audit_info,
+                    )
                     from llm_governance import extract_governance
                     from llm_inference import infer_report
                     from llm_proper_vn import infer_proper_vn_report
@@ -2363,16 +2533,18 @@ def page_company_targets():
                     run_state.summary = ""
                     run_status_panel.refresh()
 
-                    kinds = [kind] if kind != "all" else ["edc", "proper", "gov"]
+                    kinds = [kind] if kind != "all" else ["edc", "proper", "gov", "fs_audit"]
                     labels = {
                         "edc": "EDC",
                         "proper": "PROPER-VN",
                         "gov": "Governance",
+                        "fs_audit": "Financial Statement Audit",
                     }
                     tables = {
                         "edc": "inference_jobs",
                         "proper": "proper_vn_jobs",
                         "gov": "governance_jobs",
+                        "fs_audit": "financial_statement_audit_jobs",
                     }
 
                     con = get_connection()
@@ -2421,6 +2593,27 @@ def page_company_targets():
                                                 inference_model=model,
                                             )
                                             row.detail = f"Color: {cls.get('color', '?')}"
+                                        elif current == "fs_audit":
+                                            out = extract_financial_statement_audit_info(
+                                                ticker,
+                                                year,
+                                                con=con,
+                                                replace=replace,
+                                                inference_model=model,
+                                            )
+                                            fs_status = str(out.get("status") or "")
+                                            if fs_status in {"submitted", "running"}:
+                                                row.detail = "batch running on OpenAI"
+                                            else:
+                                                row.detail = (
+                                                    out.get("audit_firm")
+                                                    or out.get("audit_opinion")
+                                                    or (
+                                                        "audit extracted"
+                                                        if out.get("found")
+                                                        else "no audit evidence"
+                                                    )
+                                                )
                                         else:
                                             n = extract_governance(
                                                 ticker,
@@ -2475,6 +2668,27 @@ def page_company_targets():
                                                 inference_model=model,
                                             )
                                             row.detail = f"Color: {cls.get('color', '?')}"
+                                        elif current == "fs_audit":
+                                            out = extract_financial_statement_audit_info(
+                                                ticker,
+                                                year,
+                                                con=con,
+                                                replace=False,
+                                                inference_model=model,
+                                            )
+                                            fs_status = str(out.get("status") or "")
+                                            if fs_status in {"submitted", "running"}:
+                                                row.detail = "batch still running"
+                                            else:
+                                                row.detail = (
+                                                    out.get("audit_firm")
+                                                    or out.get("audit_opinion")
+                                                    or (
+                                                        "audit extracted"
+                                                        if out.get("found")
+                                                        else "no audit evidence"
+                                                    )
+                                                )
                                         else:
                                             n = extract_governance(
                                                 ticker,
@@ -2537,6 +2751,14 @@ def page_company_targets():
                     "Run Pending Governance",
                     on_click=lambda: _run_in_thread(
                         _make_run_pending_targets("gov"),
+                        run_state,
+                        lambda: run_status_panel.refresh(),
+                    ),
+                )
+                ui.button(
+                    "Run Pending Financial Statement Audit",
+                    on_click=lambda: _run_in_thread(
+                        _make_run_pending_targets("fs_audit"),
                         run_state,
                         lambda: run_status_panel.refresh(),
                     ),
@@ -2842,6 +3064,15 @@ def page_jobs(
                 inference_model=get_infer_model,
                 embedding_model=get_embed_model,
             ),
+            "infer_financial_statement_audit": lambda s, r: _make_extract_financial_statement_audit(
+                s,
+                r,
+                ticker_filter=get_tickers,
+                year_filter=get_years,
+                force=get_force,
+                inference_model=get_infer_model,
+                embedding_model=get_embed_model,
+            ),
             "company_history": lambda s, r: _make_sync_company_history(
                 s,
                 r,
@@ -2921,6 +3152,7 @@ def page_job_matrix():
 
     from converter import convert_financial_statement_to_markdown, create_jobs, run_job
     from llm_embeddings import embed_report
+    from llm_financial_statement_audit import extract_financial_statement_audit_info
     from llm_governance import extract_governance
     from llm_inference import infer_report
     from llm_proper_vn import infer_proper_vn_report
@@ -2997,6 +3229,7 @@ def page_job_matrix():
             "infer_edc": "Infer EDC",
             "infer_proper": "Infer PROPER-VN",
             "infer_governance": "Extract Governance",
+            "infer_financial_statement_audit": "Extract Financial Statement Audit",
         }
         run_jobs_sel = (
             ui.select(
@@ -3012,6 +3245,7 @@ def page_job_matrix():
                     "infer_edc",
                     "infer_proper",
                     "infer_governance",
+                    "infer_financial_statement_audit",
                 ],
             )
             .props(
@@ -3413,6 +3647,14 @@ def page_job_matrix():
                                         )
                                     elif job_key == "infer_governance":
                                         extract_governance(
+                                            ticker,
+                                            year,
+                                            con=con,
+                                            replace=bool(force_toggle.value),
+                                            inference_model=_inference_model(),
+                                        )
+                                    elif job_key == "infer_financial_statement_audit":
+                                        extract_financial_statement_audit_info(
                                             ticker,
                                             year,
                                             con=con,
@@ -4061,6 +4303,7 @@ def page_llm_tasks():
             return [(str(r["ticker"]), int(r["year"])) for r in filtered]
 
         embed_state = TaskState()
+        embed_financial_statement_state = TaskState()
         fetch_batch_state = TaskState()
         infer_edc_state = TaskState()
         infer_proper_state = TaskState()
@@ -4207,7 +4450,12 @@ def page_llm_tasks():
             embedding_status_panel.refresh()
             processing_status_panel.refresh()
 
-        def _make_llm_embed_task(state: TaskState, refresh: Callable) -> Callable:
+        def _make_llm_embed_task(
+            state: TaskState,
+            refresh: Callable,
+            *,
+            forced_target: str | None = None,
+        ) -> Callable:
             def run():
                 from llm_embeddings import embed_report
                 from llm_financial_statement_audit import (
@@ -4219,7 +4467,7 @@ def page_llm_tasks():
                 try:
                     init_db(con)
 
-                    embed_target = _selected_embed_target()
+                    embed_target = forced_target or _selected_embed_target()
                     annual_pairs: list[tuple[str, int]] = []
                     financial_statement_pairs: list[tuple[str, int]] = []
 
@@ -4343,6 +4591,7 @@ def page_llm_tasks():
             state: TaskState, refresh: Callable
         ) -> Callable:
             def run():
+                from llm_financial_statement_audit import extract_financial_statement_audit_info
                 from llm_governance import extract_governance
                 from llm_inference import infer_report
                 from llm_proper_vn import infer_proper_vn_report
@@ -4396,6 +4645,16 @@ def page_llm_tasks():
                         """,
                         [model],
                     ).fetchall()
+                    financial_statement_audit_jobs = con.execute(
+                        """
+                        SELECT ticker, year
+                        FROM financial_statement_audit_jobs
+                        WHERE model = ? AND batch_id IS NOT NULL
+                          AND status IN ('running', 'pending')
+                        ORDER BY ticker, year
+                        """,
+                        [model],
+                    ).fetchall()
 
                     edc_pairs = [
                         (str(t), int(y))
@@ -4412,8 +4671,18 @@ def page_llm_tasks():
                         for t, y in gov_jobs
                         if (str(t), int(y)) in allowed_pairs
                     ]
+                    financial_statement_audit_pairs = [
+                        (str(t), int(y))
+                        for t, y in financial_statement_audit_jobs
+                        if (str(t), int(y)) in allowed_pairs
+                    ]
 
-                    total_jobs = len(edc_pairs) + len(proper_pairs) + len(gov_pairs)
+                    total_jobs = (
+                        len(edc_pairs)
+                        + len(proper_pairs)
+                        + len(gov_pairs)
+                        + len(financial_statement_audit_pairs)
+                    )
                     if total_jobs == 0:
                         state.summary = (
                             "No running/pending batch jobs with batch_id found for current filters"
@@ -4574,6 +4843,41 @@ def page_llm_tasks():
                             else:
                                 status = "done"
                                 detail = f"fetched {n} items"
+                                fetched += 1
+                        except Exception as exc:
+                            status = "error"
+                            detail = str(exc)[:120]
+                            failed += 1
+                        _finish_step(row_idx, status, detail)
+
+                    for ticker, year in financial_statement_audit_pairs:
+                        row_idx = _begin_step("FINANCIAL_STATEMENT_AUDIT", ticker, year)
+                        try:
+                            out = extract_financial_statement_audit_info(
+                                ticker,
+                                year,
+                                con=con,
+                                replace=False,
+                                top_k=top_k,
+                                inference_model=model,
+                                embedding_model=embedding_model,
+                            )
+                            fs_status = str(out.get("status") or "")
+                            if fs_status in {"submitted", "running"}:
+                                status = "skipped"
+                                detail = "batch still running on OpenAI"
+                                waiting += 1
+                            else:
+                                status = "done"
+                                detail = (
+                                    out.get("audit_firm")
+                                    or out.get("audit_opinion")
+                                    or (
+                                        "audit extracted"
+                                        if out.get("found")
+                                        else "no audit evidence"
+                                    )
+                                )
                                 fetched += 1
                         except Exception as exc:
                             status = "error"
@@ -4938,6 +5242,19 @@ def page_llm_tasks():
             )
 
         @ui.refreshable
+        def embed_financial_statement_panel():
+            task_card(
+                "1B. Embed Financial Statements Only",
+                embed_financial_statement_state,
+                _make_llm_embed_task(
+                    embed_financial_statement_state,
+                    embed_financial_statement_panel.refresh,
+                    forced_target="financial_statement",
+                ),
+                embed_financial_statement_panel.refresh,
+            )
+
+        @ui.refreshable
         def infer_edc_panel():
             task_card(
                 "2. Infer EDC",
@@ -5004,6 +5321,7 @@ def page_llm_tasks():
             with ui.tab_panel("embed_tasks"):
                 embedding_status_panel()
                 embed_panel()
+                embed_financial_statement_panel()
 
             with ui.tab_panel("infer_tasks"):
                 processing_status_panel()
@@ -8493,11 +8811,11 @@ def page_converter():
                 sy, ey = ey, sy
             return sy, ey
 
-        def _ticker_filter_sql() -> tuple[str, list[str]]:
+        def _ticker_filter_sql(column_name: str = "ticker") -> tuple[str, list[str]]:
             ticker_filter = str(ticker_filter_input.value or "").strip().upper()
             if not ticker_filter:
                 return "", []
-            return " AND ticker LIKE ?", [f"%{ticker_filter}%"]
+            return f" AND {column_name} LIKE ?", [f"%{ticker_filter}%"]
 
         with ui.tabs().classes("w-full") as converter_tabs:
             ui.tab("annual", label="Annual Reports")
@@ -8508,7 +8826,7 @@ def page_converter():
                 @ui.refreshable
                 def annual_panel() -> None:
                     sy, ey = _selected_year_bounds()
-                    ticker_where, ticker_params = _ticker_filter_sql()
+                    ticker_where, ticker_params = _ticker_filter_sql("d.ticker")
 
                     con = get_connection()
                     try:
