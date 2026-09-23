@@ -1,39 +1,120 @@
 # Annual Report Pipeline
 
-Vietnamese stock data & annual report pipeline with NiceGUI web UI.
+Research code for extracting structured variables from Vietnamese corporate annual reports and audited financial statements.
 
-## Quick Start (LLM flow)
+This repository supports a paper workflow built around retrieval-augmented LLM inference on report text. The current pipeline focuses on three outputs:
 
-1. Start dashboard:
+- `EDC`: checklist-style environmental disclosure variables
+- `PROPER-VN`: environmental performance and rating variables
+- governance extraction from annual-report narrative sections
+
+The application also includes supporting utilities for document collection, PDF-to-markdown conversion, embedding generation, financial-statement ingestion, and audit-oriented evaluation.
+
+## What this repository does
+
+At a high level, the system:
+
+1. collects annual-report or financial-statement source files
+2. converts PDFs to markdown with OCR-aware processing
+3. stores normalized text in DuckDB
+4. splits reports into overlapping chunks and embeds them
+5. retrieves evidence with HyDE-enhanced search
+6. asks an LLM to produce structured research variables with traceable explanations
+
+```mermaid
+flowchart TD
+    A[PDF or archive input] --> B[OCR and markdown conversion]
+    B --> C[Load cleaned text into DuckDB]
+    C --> D[Chunk report text]
+    D --> E[Create embeddings]
+    E --> F[Retrieve evidence for each item]
+    F --> G[Run LLM inference]
+    G --> H[Store structured outputs and explanations]
+```
+
+The annual-report retrieval and scoring flow is described in more detail in [ANNUAL_REPORT_PIPELINE_EXPLAINED.md](ANNUAL_REPORT_PIPELINE_EXPLAINED.md).
+
+## Repository status
+
+This is an active research codebase rather than a polished end-user package. It is suitable for inspection, replication, and extension, but you should expect project-specific assumptions in the database schema, data directories, and inference prompts.
+
+What is included:
+
+- the core pipeline code
+- the NiceGUI dashboard used to run jobs and inspect pipeline state
+- smoke-test style CLIs for targeted runs
+- benchmark and methodology notes
+
+What is not bundled automatically:
+
+- API credentials
+- a guarantee that third-party data files are redistributable
+- pretrained model weights beyond externally hosted APIs and installed dependencies
+
+## Requirements
+
+- Python `>=3.13`
+- `uv` for dependency management and execution
+- an OpenAI API key for embedding and inference paths
+- system support for the `marker-pdf` toolchain
+- `unrar` on `PATH` if you want to process `.rar` financial-statement archives
+
+Install project dependencies with:
+
+```bash
+uv sync
+```
+
+## Configuration
+
+The app loads environment variables from `.env` in the repository root.
+
+Minimum expected variables:
+
+```env
+OPENAI_API_KEY=your_key_here
+INFERENCE_TEMPERATURE=0
+```
+
+Useful runtime knobs already supported by the codebase:
+
+- `INFERENCE_TEMPERATURE`: defaults to `0`
+- `HYDE2_ENABLED`: defaults to `1`
+- `HYDE2_MODEL`: defaults to the main inference model
+- `HYDE2_SYNTHETIC_DOC_COUNT`: defaults to `2`
+- `INFERENCE_RETRIEVAL_ALPHA`, `INFERENCE_RETRIEVAL_BETA`, `INFERENCE_RETRIEVAL_GAMMA`
+- `INFERENCE_RETRIEVAL_CANDIDATE_MULTIPLIER`
+
+Current default modeling settings in the code:
+
+- embedding model: `text-embedding-3-small`
+- embedding dimensions: `1536`
+- chunk size: `512` tokens
+- chunk overlap: `128` tokens
+- inference model: `gpt-4.1-mini`
+- retrieval depth: top `20` chunks per item
+
+## Quick start
+
+Start the dashboard:
 
 ```bash
 uv run python main.py
 ```
 
-2. In Jobs page, run these stages in order for end-to-end LLM evaluation:
-- `8. Load Markdown to DB`
-- `9. Embed Annual Reports`
-- `10. Infer EDC`
-- `11. Infer PROPER-VN`
-- `12. Extract Governance`
+The dashboard is the main orchestration UI for conversion, ingestion, embedding, and inference jobs.
 
-## Hallucination Control
+For an end-to-end annual-report inference path, the usual sequence is:
 
-Control model randomness with environment variable `INFERENCE_TEMPERATURE`.
+1. `Load Markdown to DB`
+2. `Embed Annual Reports`
+3. `Infer EDC`
+4. `Infer PROPER-VN`
+5. `Extract Governance`
 
-- Lower values are more deterministic (recommended for extraction/classification).
-- Typical range: `0.0` to `1.0`.
-- Default is `0` if not set.
+## Command-line smoke workflow
 
-Example in `.env`:
-
-```env
-INFERENCE_TEMPERATURE=0
-```
-
-## Smoke Commands
-
-Use the smoke CLI for quick validation without the UI:
+Use the CLI for narrower validation or batch operations without opening the UI:
 
 ```bash
 # Embed all loaded reports
@@ -45,138 +126,62 @@ uv run python smoke_llm.py embed-one --ticker VNM --year 2024
 # Create all inference job types from existing embeddings
 uv run python smoke_llm.py create-jobs
 
-# Run one ticker-year end-to-end inference (EDC + PROPER-VN + governance)
+# Run one ticker-year end-to-end inference
 uv run python smoke_llm.py infer-one --ticker VNM --year 2024
 
 # Rescan markdown directory and update annual_reports in DB
 uv run python smoke_llm.py rescan-markdown
 
-# Preview only (no DB changes), optionally limited to a ticker/year
+# Preview only, limited to selected ticker/year
 uv run python smoke_llm.py rescan-markdown --preview-only --tickers ASG --years 2025
 
-# Fetch company profile milestones (Moc lich su), store events, and compute firm age
+# Fetch company-history milestones and compute firm age
 uv run python smoke_llm.py sync-company-history --ticker SRF
 
 # Run for multiple tickers
 uv run python smoke_llm.py sync-company-history --tickers SRF VNM VJC
 ```
 
-## Database Schema
+## Data and directory layout
 
-`companies` is the central control table. All pipeline operations are scoped to tickers in this table. Deleting a company cascades to all related data.
+Important top-level paths:
 
-```mermaid
-erDiagram
-    companies {
-        VARCHAR ticker PK
-    }
+- [data/raw](data/raw): source files before conversion
+- [data/markdown](data/markdown): converted annual-report markdown
+- [data/markdown_financial_statement](data/markdown_financial_statement): converted audited financial-statement markdown
+- [data/output](data/output): conversion outputs and derived artifacts
+- [benchmarks](benchmarks): benchmark inputs and reports
+- [tests](tests): targeted regression tests
 
-    stocks {
-        VARCHAR code PK
-        VARCHAR type
-        VARCHAR floor
-        VARCHAR status
-        VARCHAR company_name
-        VARCHAR company_name_eng
-        VARCHAR short_name
-        VARCHAR listed_date
-        VARCHAR delisted_date
-        VARCHAR company_id
-        VARCHAR tax_code
-        VARCHAR isin
-    }
+The default database path is `db.db` in the repository root.
 
-    financial_models {
-        VARCHAR model_type
-        VARCHAR item_code
-        VARCHAR model_type_name
-        VARCHAR model_vn_desc
-        VARCHAR model_en_desc
-        VARCHAR company_form
-        VARCHAR note
-        VARCHAR code_list
-        VARCHAR item_vn_name
-        VARCHAR item_en_name
-        INTEGER display_order
-        INTEGER display_level
-        VARCHAR form_type
-    }
+## Public-release notes
 
-    financial_statements {
-        VARCHAR code
-        VARCHAR item_code
-        VARCHAR report_type
-        VARCHAR model_type
-        DOUBLE numeric_value
-        VARCHAR fiscal_date
-        VARCHAR created_date
-        VARCHAR modified_date
-    }
+If you are using this repository for replication, keep in mind:
 
-    financial_ratios {
-        VARCHAR code
-        VARCHAR ratio_group
-        VARCHAR report_date
-        VARCHAR item_code
-        VARCHAR ratio_code
-        VARCHAR item_name
-        DOUBLE value
-    }
+- some workflows depend on locally available source documents that may not be committed here
+- LLM outputs are not fully deterministic across model revisions, even with low temperature settings
+- third-party data access and redistribution rights should be checked separately from this code release
+- benchmark reports in this repository reflect the code and model behavior available at the time they were generated
 
-    vietstock_documents {
-        BIGINT id PK
-        VARCHAR ticker
-        VARCHAR doc_type
-        VARCHAR title
-        VARCHAR full_name
-        VARCHAR source
-        VARCHAR published_date
-        VARCHAR file_url
-        BIGINT file_info_id
-        BOOLEAN synced_to_raw
-        VARCHAR raw_path
-    }
+## Development and validation
 
-    conversion_jobs {
-        INTEGER id PK
-        VARCHAR ticker
-        INTEGER year
-        INTEGER start_year
-        INTEGER end_year
-        VARCHAR source_path
-        VARCHAR output_dir
-        VARCHAR status
-        VARCHAR command
-        VARCHAR log_path
-        INTEGER pid
-        VARCHAR error_message
-        VARCHAR failed_step
-        TIMESTAMP started_at
-        TIMESTAMP completed_at
-        TIMESTAMP created_at
-    }
+This repository includes targeted tests in [tests](tests). When validating code changes locally, prefer the project environment:
 
-    annual_reports {
-        VARCHAR ticker PK
-        INTEGER year PK
-        VARCHAR content
-        VARCHAR source_file
-        TIMESTAMP created_at
-    }
-
-    pipeline_files {
-        VARCHAR ticker PK
-        INTEGER year PK
-        VARCHAR stage PK
-        VARCHAR file_path
-        TIMESTAMP created_at
-    }
-
-    companies ||--o{ financial_statements : "ticker → code"
-    companies ||--o{ financial_ratios : "ticker → code"
-    companies ||--o{ vietstock_documents : "ticker"
-    companies ||--o{ conversion_jobs : "ticker"
-    companies ||--o{ annual_reports : "ticker"
-    companies ||--o{ pipeline_files : "ticker"
-    financial_models ||--o{ financial_statements : "item_code"
+```bash
+uv run pytest
 ```
+
+For narrow checks during development, use `uv run python ...` commands rather than a system Python interpreter.
+
+## Related documents
+
+- [ANNUAL_REPORT_PIPELINE_EXPLAINED.md](ANNUAL_REPORT_PIPELINE_EXPLAINED.md)
+- [METHODOLOGY.md](METHODOLOGY.md)
+- [PRD.md](PRD.md)
+- [PRD_LLM.md](PRD_LLM.md)
+- [PRD_RAG_IMPROVEMENT.md](PRD_RAG_IMPROVEMENT.md)
+
+## Citation
+
+If this repository supports a published or working paper, cite the paper and this code release together. Add the final bibliographic entry here when the manuscript details are public.
