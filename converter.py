@@ -692,6 +692,117 @@ def _normalize_archive_member_name(value: str) -> str:
     return text.replace("đ", "d")
 
 
+def _archive_pdf_language_score(filename: str) -> int:
+    """Score PDF member names to prefer Vietnamese-language report files."""
+    name = Path(filename).name.lower()
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name) if t]
+    token_set = set(tokens)
+
+    score = 0
+    if "vi" in token_set or "vietnamese" in token_set:
+        score += 10
+    if "en" in token_set or "english" in token_set:
+        score -= 10
+
+    vi_markers = {
+        "bao",
+        "cao",
+        "tai",
+        "chinh",
+        "hop",
+        "nhat",
+        "kiem",
+        "toan",
+        "thuyet",
+        "minh",
+        "viet",
+        "nam",
+    }
+    score += sum(1 for marker in vi_markers if marker in token_set)
+
+    en_markers = {
+        "audited",
+        "consolidated",
+        "financial",
+        "statements",
+        "statement",
+        "report",
+        "notes",
+        "note",
+        "english",
+    }
+    score -= sum(1 for marker in en_markers if marker in token_set)
+    return score
+
+
+def _extract_pdf_from_rar(src: Path) -> Path:
+    """Extract the best PDF candidate from a RAR archive into _extracted/."""
+    unrar = shutil.which("unrar")
+    if not unrar:
+        raise ValueError(
+            "RAR archive support requires `unrar` to be installed"
+        )
+
+    list_proc = subprocess.run(
+        [unrar, "lb", str(src)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if list_proc.returncode != 0:
+        detail = (list_proc.stderr or list_proc.stdout or "").strip()
+        raise ValueError(f"Failed to inspect RAR archive {src}: {detail}")
+
+    pdf_members: list[str] = []
+    for line in list_proc.stdout.splitlines():
+        member_name = line.strip()
+        if member_name.lower().endswith(".pdf"):
+            pdf_members.append(member_name)
+
+    if not pdf_members:
+        raise ValueError(f"No PDF found inside RAR: {src}")
+
+    extract_dir = src.parent / "_extracted"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    member_rows: list[tuple[tuple[int, int, int, int], str, bytes]] = []
+    for member_name in pdf_members:
+        extract_proc = subprocess.run(
+            [unrar, "p", "-inul", str(src), member_name],
+            check=False,
+            capture_output=True,
+        )
+        if extract_proc.returncode != 0:
+            continue
+        pdf_bytes = extract_proc.stdout
+        if not pdf_bytes:
+            continue
+        page_count = _pdf_page_count_from_bytes(pdf_bytes) or 0
+        member_stem = Path(member_name).stem
+        title_score = _financial_statement_title_quality_score(member_stem)
+        preferred_title = 1 if _is_preferred_financial_statement_title(member_stem) else 0
+        rank = (
+            preferred_title,
+            title_score,
+            page_count,
+            _archive_pdf_language_score(member_name),
+        )
+        member_rows.append((rank, member_name, pdf_bytes))
+
+    if not member_rows:
+        raise ValueError(f"No readable PDF found inside RAR: {src}")
+
+    member_rows.sort(key=lambda item: (item[0], len(item[2])), reverse=True)
+    _, member_name, pdf_bytes = member_rows[0]
+
+    safe_member_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(member_name).stem).strip("_")
+    target_stem = safe_member_stem or src.stem
+    target_pdf = extract_dir / f"{target_stem}.pdf"
+    with open(target_pdf, "wb") as wf:
+        wf.write(pdf_bytes)
+    return target_pdf
+
+
 def _pdf_page_count_from_bytes(pdf_bytes: bytes) -> int | None:
     try:
         import fitz
@@ -747,51 +858,6 @@ def _resolve_source_pdf(
     if sibling_pdf.exists():
         return sibling_pdf
 
-    def _zip_pdf_language_score(filename: str) -> int:
-        """Score PDF member names to prefer Vietnamese-language report files."""
-        name = Path(filename).name.lower()
-        # Tokenize by common separators so markers like "_vi_" are matched reliably.
-        tokens = [t for t in re.split(r"[^a-z0-9]+", name) if t]
-        token_set = set(tokens)
-
-        score = 0
-        if "vi" in token_set or "vietnamese" in token_set:
-            score += 10
-        if "en" in token_set or "english" in token_set:
-            score -= 10
-
-        # Common Vietnamese report wording often appears in unaccented filenames.
-        vi_markers = {
-            "bao",
-            "cao",
-            "tai",
-            "chinh",
-            "hop",
-            "nhat",
-            "kiem",
-            "toan",
-            "thuyet",
-            "minh",
-            "viet",
-            "nam",
-        }
-        score += sum(1 for marker in vi_markers if marker in token_set)
-
-        # English report wording reduces priority when both language variants exist.
-        en_markers = {
-            "audited",
-            "consolidated",
-            "financial",
-            "statements",
-            "statement",
-            "report",
-            "notes",
-            "note",
-            "english",
-        }
-        score -= sum(1 for marker in en_markers if marker in token_set)
-        return score
-
     if src.suffix.lower() == ".zip":
         extract_dir = src.parent / "_extracted"
         extract_dir.mkdir(parents=True, exist_ok=True)
@@ -835,7 +901,7 @@ def _resolve_source_pdf(
                     preferred_title,
                     title_score,
                     page_count,
-                    _zip_pdf_language_score(info.filename),
+                    _archive_pdf_language_score(info.filename),
                     info.file_size,
                 )
                 member_rows.append((rank, info, pdf_bytes))
@@ -861,6 +927,9 @@ def _resolve_source_pdf(
             with open(target_pdf, "wb") as wf:
                 wf.write(pdf_bytes)
             return target_pdf
+
+    if src.suffix.lower() == ".rar":
+        return _extract_pdf_from_rar(src)
 
     if allow_manual_updated_files:
         candidate = None
