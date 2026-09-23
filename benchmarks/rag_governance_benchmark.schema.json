@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Governance RAG Benchmark",
+  "type": "object",
+  "required": ["version", "cases"],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "ticker", "year", "item_code"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "ticker": {
+            "type": "string"
+          },
+          "year": {
+            "type": "integer"
+          },
+          "item_code": {
+            "type": "string",
+            "enum": [
+              "GOV_SHAREHOLDERS",
+              "GOV_DIRECTORY",
+              "GOV_EXECUTIVE",
+              "GOV_AUDIT",
+              "GOV_SUPERVISORY"
+            ]
+          },
+          "required_terms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "forbidden_terms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expected_entities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "expected_count": {
+            "type": "integer"
+          },
+          "source_section_hints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "enabled_for_extraction_eval": {
+            "type": "boolean",
+            "default": false
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
